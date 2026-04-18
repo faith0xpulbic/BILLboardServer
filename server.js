@@ -1025,12 +1025,221 @@ function generateBlankPngBase64(width, height) {
   return png.toString("base64");
 }
 
-const DEFAULT_SYSTEM_PROMPT = `Use the LAST uploaded image ONLY as the exact layout canvas and aspect ratio.
-Do not crop, stretch, resize, or change the dimensions of this canvas at all.
-Take the first image (the source advertisement) and redesign it to perfectly fill this wide horizontal billboard format.
-Extend the background left and right, reposition text and elements for left-to-right flow, maintain exact brand colors/fonts/styles.
-Sharpen text and logos for billboard clarity.
-Output in high-fidelity, respecting the exact proportions of the final blank canvas.`;
+// ====================== ENGINEERED PROMPT ======================
+
+const DEFAULT_SYSTEM_PROMPT = `You are an expert billboard creative adapter. Analyze the source advertisement image and identify its visual hierarchy:
+
+1. PRIMARY FOCAL POINT: The main subject (product, person, or key visual element)
+2. SECONDARY ELEMENTS: Supporting text, taglines, pricing
+3. BRAND IDENTITY: Logos, brand names, social handles
+4. BACKGROUND: Colors, textures, ambient elements
+
+Your task:
+- Redesign the composition to fill the EXACT canvas dimensions provided
+- Preserve and EMPHASIZE the primary focal point — it must remain dominant and clear
+- Reposition secondary text so it reads naturally in the new aspect ratio
+- Keep logos and brand elements sharp and legible, never cropped
+- Extend or fill background intelligently — match colors, patterns, and lighting seamlessly
+- If upscaling is needed, preserve fine details and text crispness
+- Fill the entire canvas edge-to-edge. NO letterboxing, NO centered crops, NO empty borders
+- Maintain the original creative intent and brand aesthetic exactly
+
+Output high-fidelity, print-ready quality.`;
+
+// ====================== IMAGE DIMENSION HELPER ======================
+
+function getImageDimensionsFromBase64(base64String) {
+  const buffer = Buffer.from(base64String, 'base64');
+  
+  // PNG
+  if (buffer[0] === 0x89 && buffer[1] === 0x50) {
+    return {
+      width: buffer.readUInt32BE(16),
+      height: buffer.readUInt32BE(20),
+      format: 'png'
+    };
+  }
+  
+  // JPEG
+  let offset = 0;
+  while (offset < buffer.length) {
+    if (buffer[offset] === 0xFF) {
+      if (buffer[offset + 1] === 0xC0 || buffer[offset + 1] === 0xC2) {
+        return {
+          height: buffer.readUInt16BE(offset + 5),
+          width: buffer.readUInt16BE(offset + 7),
+          format: 'jpeg'
+        };
+      }
+    }
+    offset++;
+  }
+  
+  return null;
+}
+
+// ====================== UPDATED ENDPOINT ======================
+
+app.post('/api/refit/simple-test', uploadMemory.single('image'), async (req, res) => {
+  try {
+    const apiKey = process.env.GEMINI_API_KEY;
+    if (!apiKey) {
+      return res.status(500).json({ error: 'GEMINI_API_KEY not set' });
+    }
+
+    if (!req.file) {
+      return res.status(400).json({ error: 'No image file uploaded' });
+    }
+
+    const targetWidth = parseInt(req.body.targetWidth) || 1920;
+    const targetHeight = parseInt(req.body.targetHeight) || 1080;
+
+    console.log("\n========================================");
+    console.log("🔥 REFIT REQUEST");
+    console.log("========================================");
+    console.log("Original file:", req.file.originalname);
+    console.log("Original size:", req.file.size, "bytes");
+    console.log("Original mime:", req.file.mimetype);
+    console.log("Target dimensions:", targetWidth, "x", targetHeight);
+
+    const imageBase64 = req.file.buffer.toString('base64');
+    const mimeType = req.file.mimetype || 'image/jpeg';
+
+    const targetAspectRatio = simplifyAspectRatio(targetWidth, targetHeight);
+    const useReferenceCanvasFallback = !SUPPORTED_ASPECT_RATIOS.has(targetAspectRatio);
+    
+    console.log("Target aspect ratio:", targetAspectRatio);
+    console.log("Native support:", !useReferenceCanvasFallback);
+
+    const referenceCanvas = useReferenceCanvasFallback 
+      ? getReferenceCanvasDimensions(targetWidth, targetHeight) 
+      : null;
+    const blankBase64 = referenceCanvas 
+      ? generateBlankPngBase64(referenceCanvas.width, referenceCanvas.height) 
+      : null;
+
+    const finalPrompt = `${DEFAULT_SYSTEM_PROMPT}
+
+Target canvas: ${targetWidth}x${targetHeight}px (${targetAspectRatio}).
+${referenceCanvas
+  ? `The last image is a blank reference canvas sized ${referenceCanvas.width}x${referenceCanvas.height}px. Use it as the exact composition guide.`
+  : 'Use the native aspect ratio controls to achieve the target dimensions.'}`;
+
+    const requestParts = [
+      { inlineData: { mimeType, data: imageBase64 } },
+    ];
+
+    if (blankBase64) {
+      requestParts.push({
+        inlineData: { mimeType: "image/png", data: blankBase64 },
+      });
+    }
+
+    requestParts.push({ text: finalPrompt });
+
+    const requestBody = {
+      contents: [{ role: "user", parts: requestParts }],
+      generationConfig: {
+        responseModalities: ["IMAGE"],
+        ...(!useReferenceCanvasFallback && {
+          imageConfig: {
+            imageSize: "4K",
+            aspectRatio: targetAspectRatio,
+          },
+        }),
+      },
+    };
+
+    console.log("\n⏳ Sending to Gemini...");
+    const startTime = Date.now();
+
+    const projectId = "project-b275f288-bac3-429e-877";
+    const region = "global";
+    const model = "gemini-3-pro-image-preview";
+
+    const response = await fetch(
+      `https://aiplatform.googleapis.com/v1/projects/${projectId}/locations/${region}/publishers/google/models/${model}:generateContent?key=${apiKey}`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(requestBody),
+      }
+    );
+
+    const duration = Date.now() - startTime;
+    console.log("Gemini response status:", response.status);
+    console.log("Gemini response time:", duration + "ms");
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      console.error("❌ Gemini error:", errorText);
+      throw new Error(`Gemini API error (${response.status})`);
+    }
+
+    const result = await response.json();
+    const candidate = result.candidates?.[0];
+    const parts = candidate?.content?.parts;
+
+    console.log("Candidates:", result.candidates?.length);
+    console.log("Finish reason:", candidate?.finishReason);
+
+    if (!parts) {
+      throw new Error("No content parts in response");
+    }
+
+    for (const part of parts) {
+      if (part.inlineData) {
+        const generatedBase64 = part.inlineData.data;
+        const generatedMime = part.inlineData.mimeType || "image/png";
+        
+        // LOG ACTUAL OUTPUT DIMENSIONS
+        const dims = getImageDimensionsFromBase64(generatedBase64);
+        if (dims) {
+          const generatedRatio = (dims.width / dims.height).toFixed(4);
+          const targetRatio = (targetWidth / targetHeight).toFixed(4);
+          const ratioDiff = Math.abs(parseFloat(generatedRatio) - parseFloat(targetRatio)).toFixed(4);
+          
+          console.log("\n📐 OUTPUT ANALYSIS");
+          console.log("----------------------------------------");
+          console.log("Output format:", dims.format);
+          console.log("Output width:", dims.width);
+          console.log("Output height:", dims.height);
+          console.log("Output aspect ratio:", generatedRatio);
+          console.log("Target aspect ratio:", targetRatio);
+          console.log("Ratio difference:", ratioDiff);
+          console.log("Ratio match:", ratioDiff < 0.05 ? "✅ PASS" : "⚠️ DRIFT");
+          console.log("----------------------------------------\n");
+        } else {
+          console.log("⚠️ Could not parse output dimensions");
+        }
+
+        const dataUrl = `data:${generatedMime};base64,${generatedBase64}`;
+
+        return res.json({
+          success: true,
+          result: {
+            imageBase64: generatedBase64,
+            mimeType: generatedMime,
+            dataUrl: dataUrl,
+            targetWidth,
+            targetHeight,
+            targetAspectRatio,
+            outputWidth: dims?.width,
+            outputHeight: dims?.height,
+            outputAspectRatio: dims ? (dims.width / dims.height).toFixed(4) : null
+          }
+        });
+      }
+    }
+
+    throw new Error("No image in response");
+
+  } catch (err) {
+    console.error("❌ Endpoint error:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 
 // Gemini refit generation function
 async function generateRefitWithGemini(imageUrl, targetWidth, targetHeight, targetAspectRatio) {
