@@ -1366,7 +1366,6 @@ app.post('/api/refit/placement', auth, async (req, res) => {
 
 console.log("📝 Registering refit endpoints...");
 
-const multer = require('multer');
 const uploadMemory = multer({ storage: multer.memoryStorage() });
 
 // Health check
