@@ -1363,97 +1363,62 @@ app.post('/api/refit/placement', auth, async (req, res) => {
 });
 
 // ===// ====================== SIMPLE REFIT TEST (NO AUTH) ======================
-
-console.log("📝 Registering refit endpoints...");
-
-const uploadMemory = multer({ storage: multer.memoryStorage() });
-
-// Health check
-app.get('/api/refit/health', (req, res) => {
-  console.log("✅ Health check hit");
-  res.json({ status: 'ok', timestamp: new Date().toISOString() });
-});
-
-// Simple test endpoint
 app.post('/api/refit/simple-test', uploadMemory.single('image'), async (req, res) => {
-  console.log("🔥 SIMPLE TEST ENDPOINT HIT");
-  
-  // Check API key is configured
-  const apiKey = process.env.GEMINI_API_KEY;
-  if (!apiKey) {
-    console.error("❌ GEMINI_API_KEY not set in environment");
-    return res.status(500).json({ error: 'Server configuration error: GEMINI_API_KEY not set' });
-  }
-  
-  console.log("API Key present:", apiKey.substring(0, 10) + "...");
-  console.log("Headers:", req.headers['content-type']);
-  console.log("File present:", !!req.file);
-  console.log("Body:", req.body);
-  
   try {
+    const apiKey = process.env.GEMINI_API_KEY;
+    if (!apiKey) {
+      return res.status(500).json({ error: 'GEMINI_API_KEY not set' });
+    }
+
     if (!req.file) {
-      console.log("❌ No file uploaded");
       return res.status(400).json({ error: 'No image file uploaded' });
     }
 
     const targetWidth = parseInt(req.body.targetWidth) || 1920;
     const targetHeight = parseInt(req.body.targetHeight) || 1080;
 
-    console.log("=== SIMPLE REFIT TEST ===");
+    console.log("\n========================================");
+    console.log("🔥 REFIT REQUEST");
+    console.log("========================================");
+    console.log("Original file:", req.file.originalname);
     console.log("Original size:", req.file.size, "bytes");
-    console.log("Mime type:", req.file.mimetype);
-    console.log("Target:", targetWidth, "x", targetHeight);
+    console.log("Original mime:", req.file.mimetype);
+    console.log("Target dimensions:", targetWidth, "x", targetHeight);
 
     const imageBase64 = req.file.buffer.toString('base64');
     const mimeType = req.file.mimetype || 'image/jpeg';
 
+    // ALWAYS use canvas method - no native aspect ratio support
+    const referenceCanvas = getReferenceCanvasDimensions(targetWidth, targetHeight);
+    const blankBase64 = generateBlankPngBase64(referenceCanvas.width, referenceCanvas.height);
+    
     const targetAspectRatio = simplifyAspectRatio(targetWidth, targetHeight);
-    const useReferenceCanvasFallback = !SUPPORTED_ASPECT_RATIOS.has(targetAspectRatio);
     
     console.log("Target aspect ratio:", targetAspectRatio);
-    console.log("Using canvas fallback:", useReferenceCanvasFallback);
-
-    const referenceCanvas = useReferenceCanvasFallback 
-      ? getReferenceCanvasDimensions(targetWidth, targetHeight) 
-      : null;
-    const blankBase64 = referenceCanvas 
-      ? generateBlankPngBase64(referenceCanvas.width, referenceCanvas.height) 
-      : null;
+    console.log("Reference canvas:", referenceCanvas.width, "x", referenceCanvas.height);
 
     const finalPrompt = `${DEFAULT_SYSTEM_PROMPT}
 
-Target output size: ${targetWidth}x${targetHeight}px.${
-    referenceCanvas
-      ? ` The last image is a blank black reference canvas sized ${referenceCanvas.width}x${referenceCanvas.height}px. Use it as the exact composition guide and aspect ratio.`
-      : ""
-  }`;
+Target canvas: ${targetWidth}x${targetHeight}px (${targetAspectRatio}).
+The last image is a blank reference canvas sized ${referenceCanvas.width}x${referenceCanvas.height}px. Use it as the exact composition guide.`;
 
     const requestParts = [
       { inlineData: { mimeType, data: imageBase64 } },
+      { inlineData: { mimeType: "image/png", data: blankBase64 } },
+      { text: finalPrompt }
     ];
-
-    if (blankBase64) {
-      requestParts.push({
-        inlineData: { mimeType: "image/png", data: blankBase64 },
-      });
-    }
-
-    requestParts.push({ text: finalPrompt });
 
     const requestBody = {
       contents: [{ role: "user", parts: requestParts }],
       generationConfig: {
-        responseModalities: ["IMAGE"],
-        ...(!useReferenceCanvasFallback && {
-          imageConfig: {
-            imageSize: "4K",
-            aspectRatio: targetAspectRatio,
-          },
-        }),
-      },
+        responseModalities: ["IMAGE"]
+        // NO imageConfig - canvas only
+      }
     };
 
-    console.log("Sending to Gemini...");
+    console.log("\n⏳ Sending to Gemini...");
+    const startTime = Date.now();
+
     const projectId = "project-b275f288-bac3-429e-877";
     const region = "global";
     const model = "gemini-3-pro-image-preview";
@@ -1467,44 +1432,74 @@ Target output size: ${targetWidth}x${targetHeight}px.${
       }
     );
 
+    const duration = Date.now() - startTime;
     console.log("Gemini response status:", response.status);
+    console.log("Gemini response time:", duration + "ms");
 
     if (!response.ok) {
       const errorText = await response.text();
-      console.error("Gemini error:", errorText);
-      throw new Error(`Gemini API error (${response.status}): ${errorText}`);
+      console.error("❌ Gemini error:", errorText);
+      throw new Error(`Gemini API error (${response.status})`);
     }
 
     const result = await response.json();
-    console.log("Gemini result candidates:", result.candidates?.length);
+    const candidate = result.candidates?.[0];
+    const parts = candidate?.content?.parts;
 
-    if (!result.candidates?.[0]?.content?.parts) {
-      throw new Error("No content in Gemini response");
+    console.log("Candidates:", result.candidates?.length);
+    console.log("Finish reason:", candidate?.finishReason);
+
+    if (!parts) {
+      throw new Error("No content parts in response");
     }
 
-    for (const part of result.candidates[0].content.parts) {
+    for (const part of parts) {
       if (part.inlineData) {
-        console.log("✅ Image generated successfully");
-        const dataUrl = `data:${part.inlineData.mimeType};base64,${part.inlineData.data}`;
+        const generatedBase64 = part.inlineData.data;
+        const generatedMime = part.inlineData.mimeType || "image/png";
         
+        // LOG ACTUAL OUTPUT DIMENSIONS
+        const dims = getImageDimensionsFromBase64(generatedBase64);
+        if (dims) {
+          const generatedRatio = (dims.width / dims.height).toFixed(4);
+          const targetRatio = (targetWidth / targetHeight).toFixed(4);
+          const ratioDiff = Math.abs(parseFloat(generatedRatio) - parseFloat(targetRatio)).toFixed(4);
+          
+          console.log("\n📐 OUTPUT ANALYSIS");
+          console.log("----------------------------------------");
+          console.log("Output format:", dims.format);
+          console.log("Output width:", dims.width);
+          console.log("Output height:", dims.height);
+          console.log("Output aspect ratio:", generatedRatio);
+          console.log("Target aspect ratio:", targetRatio);
+          console.log("Ratio difference:", ratioDiff);
+          console.log("Ratio match:", ratioDiff < 0.05 ? "✅ PASS" : "⚠️ DRIFT");
+          console.log("----------------------------------------\n");
+        }
+
+        const dataUrl = `data:${generatedMime};base64,${generatedBase64}`;
+
         return res.json({
           success: true,
           result: {
-            imageBase64: part.inlineData.data,
-            mimeType: part.inlineData.mimeType,
+            imageBase64: generatedBase64,
+            mimeType: generatedMime,
             dataUrl: dataUrl,
             targetWidth,
             targetHeight,
-            aspectRatio: targetAspectRatio
+            targetAspectRatio,
+            outputWidth: dims?.width,
+            outputHeight: dims?.height,
+            outputAspectRatio: dims ? (dims.width / dims.height).toFixed(4) : null
           }
         });
       }
     }
 
-    throw new Error("No image generated");
+    throw new Error("No image in response");
 
   } catch (err) {
-    console.error("❌ Simple refit test error:", err);
+    console.error("❌ Endpoint error:", err);
     res.status(500).json({ error: err.message });
   }
 });
