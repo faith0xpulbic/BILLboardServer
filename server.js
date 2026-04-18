@@ -1034,7 +1034,8 @@ Output in high-fidelity, respecting the exact proportions of the final blank can
 
 // Gemini refit generation function
 async function generateRefitWithGemini(imageUrl, targetWidth, targetHeight, targetAspectRatio) {
-  const apiKey = "-u-zlX6w";
+  const apiKey = process.env.GEMINI_API_KEY;
+
   
   // Download image from URL
   const imageResponse = await fetch(imageUrl);
