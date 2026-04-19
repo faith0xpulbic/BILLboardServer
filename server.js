@@ -8,7 +8,7 @@ const cors = require("cors");
 const cloudinary = require("cloudinary").v2;
 const multer = require("multer");
 const NodeCache = require("node-cache");
-require("dotenv").config(); 
+require("dotenv").config();
 
 const app = express();
 const server = http.createServer(app);
@@ -42,6 +42,7 @@ cloudinary.config({
 });
 
 const upload = multer({ dest: "uploads/" });
+const uploadMemory = multer({ storage: multer.memoryStorage() });
 
 // ====================== SOCKET.IO ======================
 io.on("connection", (socket) => {
@@ -74,24 +75,23 @@ const User = mongoose.model(
     email: { type: String, required: true, unique: true, lowercase: true },
     passwordHash: { type: String, required: true },
     role: { type: String, enum: ["user", "company", "reviewer", "admin"], default: "user" },
-    organizationName: { type: String, required: true }, // ✅ CHANGED: companyName → organizationName
+    organizationName: { type: String, required: true },
     verified: { type: Boolean, default: true },
     createdAt: { type: Date, default: Date.now },
   }),
 );
 
-// ✅ FIXED CAMPAIGN MODEL - Matches client exactly
 const Campaign = mongoose.model(
   "Campaign",
   new mongoose.Schema(
     {
       userId: { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true },
-      campaignName: { type: String, required: true }, // ✅ CHANGED: title → campaignName
+      campaignName: { type: String, required: true },
       description: { type: String, required: true },
-      organizationName: { type: String, required: true }, // ✅ From user account
-      category: { type: String, required: true }, // ✅ ADDED
-      targetLocation: { type: String, enum: ["local", "worldwide", "both"], required: true }, // ✅ ADDED
-      uploadedCreative: { type: String, default: null }, // ✅ Cloudinary URL
+      organizationName: { type: String, required: true },
+      category: { type: String, required: true },
+      targetLocation: { type: String, enum: ["local", "worldwide", "both"], required: true },
+      uploadedCreative: { type: String, default: null },
       status: { type: String, enum: ["pending", "active", "completed"], default: "pending" },
       createdAt: { type: Date, default: Date.now },
       updatedAt: { type: Date, default: Date.now },
@@ -100,7 +100,6 @@ const Campaign = mongoose.model(
   ),
 );
 
-// ✅ FIXED UPLOAD MODEL - Added missing fields
 const Upload = mongoose.model(
   "Upload",
   new mongoose.Schema(
@@ -122,8 +121,6 @@ const Upload = mongoose.model(
       approvedAt: Date,
       reviewedAt: Date,
       declineReason: String,
-      
-      // NEW: Refits storage
       refits: {
         type: Map,
         of: new mongoose.Schema({
@@ -134,25 +131,21 @@ const Upload = mongoose.model(
         }, { _id: false }),
         default: new Map()
       }
-      
     },
     { timestamps: true }
   )
 );
 
-
-
-// ✅ FIXED FAVORITE MODEL - pinId should be String, not ObjectId
 const Favorite = mongoose.model(
   "Favorite",
   new mongoose.Schema(
     {
       userId: { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true },
-      pinId: { type: String, required: true }, // ✅ CHANGED: ObjectId → String
-      billboardId: String, // ✅ ADDED
-      latitude: Number, // ✅ ADDED
-      longitude: Number, // ✅ ADDED
-      address: String, // ✅ ADDED
+      pinId: { type: String, required: true },
+      billboardId: String,
+      latitude: Number,
+      longitude: Number,
+      address: String,
       createdAt: { type: Date, default: Date.now },
     },
     { timestamps: true },
@@ -190,6 +183,9 @@ const placementSchema = new mongoose.Schema(
   { timestamps: true }
 );
 
+// FIX: Register Placement model (was missing)
+const Placement = mongoose.model('Placement', placementSchema);
+
 // Create unique index for favorites
 Favorite.collection.createIndex({ userId: 1, pinId: 1 }, { unique: true });
 
@@ -216,7 +212,6 @@ function requireRole(role) {
   };
 }
 
-// ====================== OPTIONAL AUTH MIDDLEWARE (NEW) ======================
 const optionalAuth = (req, res, next) => {
   const token = req.header("Authorization")?.replace("Bearer ", "");
   if (!token) {
@@ -242,7 +237,6 @@ app.post("/api/auth/register", async (req, res) => {
     return res.status(400).json({ error: "Email and password required" });
   }
 
-  // ✅ FIXED: organizationName is required
   const organizationName = role === "company" ? companyName : companyName || email.split("@")[0];
 
   if (!organizationName) {
@@ -259,7 +253,7 @@ app.post("/api/auth/register", async (req, res) => {
       email,
       passwordHash: hashed,
       role: role || "user",
-      organizationName: organizationName, // ✅ CHANGED: companyName → organizationName
+      organizationName,
       verified: true,
     });
 
@@ -289,7 +283,7 @@ app.post("/api/auth/login", async (req, res) => {
     if (!match) return res.status(401).json({ error: "Invalid credentials" });
 
     const accessToken = jwt.sign(
-      { userId: user._id, role: user.role, organizationName: user.organizationName }, // ✅ ADDED organizationName to token
+      { userId: user._id, role: user.role, organizationName: user.organizationName },
       process.env.JWT_SECRET,
       { expiresIn: "1h" },
     );
@@ -304,7 +298,7 @@ app.post("/api/auth/login", async (req, res) => {
       accessToken,
       refreshToken,
       role: user.role,
-      organizationName: user.organizationName, // ✅ ADDED
+      organizationName: user.organizationName,
       message: "Login successful",
     });
   } catch (err) {
@@ -375,53 +369,189 @@ app.put("/api/pins/:id/approve", auth, requireRole("admin"), async (req, res) =>
     res.status(500).json({ error: err.message });
   }
 });
-// POST /api/uploads/:id/refits
-// Create a refit for an existing upload
+
+// ====================== UPLOAD ROUTES ======================
 
 app.post('/api/uploads/:id/refits', auth, async (req, res) => {
   try {
     const { refitSize, cloudinaryUrl, publicId, dimensions } = req.body;
-    
+
     const upload = await Upload.findById(req.params.id);
     if (!upload) return res.status(404).json({ error: 'Upload not found' });
-    
-    // Check ownership
+
     if (upload.userId.toString() !== req.user.userId) {
       return res.status(403).json({ error: 'Unauthorized' });
     }
-    
-    // Add refit to the Map
+
     upload.refits.set(refitSize, {
       cloudinaryUrl,
       publicId,
       dimensions,
       createdAt: new Date()
     });
-    
+
     await upload.save();
-    
+
     res.json({ success: true, refit: upload.refits.get(refitSize) });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
+app.post("/api/uploads", auth, upload.single("file"), async (req, res) => {
+  try {
+    console.log("📥 Received upload request for campaign:", req.body.campaignId);
 
-// ====================== CAMPAIGN ROUTES (FIXED) ======================
+    if (!req.file) {
+      return res.status(400).json({ error: "No file uploaded" });
+    }
 
-// ✅ FIXED: Create campaign
+    if (!req.body.campaignId) {
+      return res.status(400).json({ error: "campaignId is required" });
+    }
+
+    const result = await cloudinary.uploader.upload(req.file.path, {
+      upload_preset: "Upload",
+      resource_type: "auto",
+    });
+
+    console.log("✓ Uploaded to Cloudinary:", result.public_id);
+
+    let daysSelected = 7;
+    if (req.body.daysSelected) {
+      try {
+        daysSelected =
+          typeof req.body.daysSelected === "string"
+            ? JSON.parse(req.body.daysSelected)
+            : Number(req.body.daysSelected);
+      } catch (e) {
+        daysSelected = Number(req.body.daysSelected) || 7;
+      }
+    }
+
+    const newUpload = new Upload({
+      campaignId: req.body.campaignId,
+      userId: req.user.userId,
+      cloudinaryUrl: result.secure_url,
+      publicId: result.public_id,
+      resourceType: result.resource_type,
+      format: result.format,
+      dimensions: { width: result.width, height: result.height },
+      resolution: `${result.width}x${result.height}`,
+      aspectRatio: result.aspect_ratio,
+      length: result.duration || null,
+      sizeBytes: result.bytes,
+      daysSelected,
+      organizationName: req.user.organizationName,
+      status: "pending",
+    });
+
+    await newUpload.save();
+
+    console.log("✓ Upload saved:", newUpload._id);
+
+    await Campaign.findByIdAndUpdate(req.body.campaignId, {
+      uploadedCreative: result.secure_url,
+      updatedAt: new Date(),
+    });
+
+    console.log(`✓ Campaign ${req.body.campaignId} updated with creative URL`);
+
+    io.to("reviewers").emit("new-upload", newUpload);
+
+    require("fs").unlinkSync(req.file.path);
+
+    res.status(201).json({ success: true, upload: newUpload });
+  } catch (err) {
+    console.error("Upload error:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.put("/api/uploads/:id", auth, upload.single("file"), async (req, res) => {
+  try {
+    const oldUpload = await Upload.findById(req.params.id);
+    if (!oldUpload) return res.status(404).json({ error: "Upload not found" });
+
+    if (!req.file) return res.status(400).json({ error: "No file uploaded" });
+
+    const result = await cloudinary.uploader.upload(req.file.path, {
+      upload_preset: "Upload",
+      resource_type: "auto",
+    });
+
+    const newUpload = new Upload({
+      campaignId: oldUpload.campaignId,
+      userId: req.user.userId,
+      cloudinaryUrl: result.secure_url,
+      publicId: result.public_id,
+      resourceType: result.resource_type,
+      format: result.format,
+      dimensions: { width: result.width, height: result.height },
+      resolution: `${result.width}x${result.height}`,
+      aspectRatio: result.aspect_ratio,
+      length: result.duration || null,
+      sizeBytes: result.bytes,
+      daysSelected: oldUpload.daysSelected,
+      organizationName: req.user.organizationName,
+      status: "pending",
+    });
+
+    await newUpload.save();
+
+    console.log(`✓ Created NEW upload ${newUpload._id} (replacing old ${oldUpload._id})`);
+
+    await Campaign.findByIdAndUpdate(oldUpload.campaignId, {
+      uploadedCreative: result.secure_url,
+      updatedAt: new Date(),
+    });
+
+    require("fs").unlinkSync(req.file.path);
+
+    res.json({ success: true, upload: newUpload });
+  } catch (err) {
+    console.error("Replace upload error:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/api/uploads', async (req, res) => {
+  try {
+    const { campaignId, status } = req.query;
+    let query = {};
+    if (campaignId) query.campaignId = campaignId;
+    if (status) query.status = status;
+
+    const uploads = await Upload.find(query)
+      .populate('campaignId', 'campaignName organizationName description')
+      .sort({ createdAt: -1 });
+
+    const result = uploads.map(u => ({
+      ...u.toObject(),
+      campaign: u.campaignId,
+      campaignId: u.campaignId._id
+    }));
+
+    res.json({ success: true, uploads: result });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ====================== CAMPAIGN ROUTES ======================
+
 app.post("/api/campaigns", auth, async (req, res) => {
   try {
     console.log("📥 Received campaign creation request:", req.body);
 
     const campaign = new Campaign({
       userId: req.user.userId,
-      campaignName: req.body.campaignName, // ✅ FIXED: title → campaignName
+      campaignName: req.body.campaignName,
       description: req.body.description,
-      organizationName: req.user.organizationName, // ✅ FROM TOKEN, not request body
-      category: req.body.category, // ✅ ADDED
-      targetLocation: req.body.targetLocation, // ✅ ADDED
-      uploadedCreative: req.body.uploadedCreative || null, // ✅ ADDED
+      organizationName: req.user.organizationName,
+      category: req.body.category,
+      targetLocation: req.body.targetLocation,
+      uploadedCreative: req.body.uploadedCreative || null,
       status: "pending",
     });
 
@@ -436,7 +566,6 @@ app.post("/api/campaigns", auth, async (req, res) => {
   }
 });
 
-// ✅ FIXED: Get all campaigns (company sees only own, reviewer sees all)
 app.get("/api/campaigns", optionalAuth, async (req, res) => {
   try {
     let query = {};
@@ -463,7 +592,6 @@ app.get("/api/campaigns", optionalAuth, async (req, res) => {
   }
 });
 
-// ✅ FIXED: Get single campaign
 app.get("/api/campaigns/:id", optionalAuth, async (req, res) => {
   try {
     let query = { _id: req.params.id };
@@ -485,218 +613,7 @@ app.get("/api/campaigns/:id", optionalAuth, async (req, res) => {
   }
 });
 
-// ====================== UPLOAD ROUTES (FIXED) ======================
-
-// ✅ FIXED: Upload with all required fields
-app.post("/api/uploads", auth, upload.single("file"), async (req, res) => {
-  try {
-    console.log("📥 Received upload request for campaign:", req.body.campaignId);
-
-    if (!req.file) {
-      return res.status(400).json({ error: "No file uploaded" });
-    }
-
-    if (!req.body.campaignId) {
-      return res.status(400).json({ error: "campaignId is required" });
-    }
-
-    // Upload to Cloudinary
-    const result = await cloudinary.uploader.upload(req.file.path, {
-      upload_preset: "Upload",
-      resource_type: "auto",
-    });
-
-    console.log("✓ Uploaded to Cloudinary:", result.public_id);
-
-    // Parse daysSelected (can be number or JSON string)
-    let daysSelected = 7;
-    if (req.body.daysSelected) {
-      try {
-        daysSelected =
-          typeof req.body.daysSelected === "string"
-            ? JSON.parse(req.body.daysSelected)
-            : Number(req.body.daysSelected);
-      } catch (e) {
-        daysSelected = Number(req.body.daysSelected) || 7;
-      }
-    }
-
-    const newUpload = new Upload({
-      campaignId: req.body.campaignId,
-      userId: req.user.userId,
-      cloudinaryUrl: result.secure_url,
-      publicId: result.public_id,
-      resourceType: result.resource_type, // ✅ ADDED
-      format: result.format,
-      dimensions: { width: result.width, height: result.height },
-      resolution: `${result.width}x${result.height}`, // ✅ ADDED
-      aspectRatio: result.aspect_ratio,
-      length: result.duration || null,
-      sizeBytes: result.bytes, // ✅ ADDED
-      daysSelected: daysSelected,
-      organizationName: req.user.organizationName, // ✅ ADDED (from token)
-      status: "pending",
-    });
-
-    await newUpload.save();
-
-    console.log("✓ Upload saved:", newUpload._id);
-
-    // ⚠️ UPDATE CAMPAIGN'S uploadedCreative FIELD
-    await Campaign.findByIdAndUpdate(req.body.campaignId, {
-      uploadedCreative: result.secure_url,
-      updatedAt: new Date(),
-    });
-
-    console.log(`✓ Campaign ${req.body.campaignId} updated with creative URL`);
-
-    // Emit socket event for reviewers
-    io.to("reviewers").emit("new-upload", newUpload);
-
-    // Clean up temp file
-    require("fs").unlinkSync(req.file.path);
-
-    res.status(201).json({ success: true, upload: newUpload });
-  } catch (err) {
-    console.error("Upload error:", err);
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// ✅ Replace upload (fixed)
-// ✅ NEW: Replace Upload → Create NEW upload (keep old one untouched)
-app.put("/api/uploads/:id", auth, upload.single("file"), async (req, res) => {
-  try {
-    // 1. Find the OLD upload (we don't modify it)
-    const oldUpload = await Upload.findById(req.params.id);
-    if (!oldUpload) return res.status(404).json({ error: "Upload not found" });
-
-    if (!req.file) return res.status(400).json({ error: "No file uploaded" });
-
-    // 2. Upload new file to Cloudinary
-    const result = await cloudinary.uploader.upload(req.file.path, {
-      upload_preset: "Upload",
-      resource_type: "auto",
-    });
-
-    // 3. Create BRAND NEW Upload document (new _id)
-    const newUpload = new Upload({
-      campaignId: oldUpload.campaignId,
-      userId: req.user.userId,
-      cloudinaryUrl: result.secure_url,
-      publicId: result.public_id,
-      resourceType: result.resource_type,
-      format: result.format,
-      dimensions: { width: result.width, height: result.height },
-      resolution: `\( {result.width}x \){result.height}`,
-      aspectRatio: result.aspect_ratio,
-      length: result.duration || null,
-      sizeBytes: result.bytes,
-      daysSelected: oldUpload.daysSelected,
-      organizationName: req.user.organizationName,
-      status: "pending",                    // new upload starts as pending again
-    });
-
-    await newUpload.save();
-
-    console.log(`✓ Created NEW upload ${newUpload._id} (replacing old ${oldUpload._id})`);
-
-    // 4. Update the Campaign to point to the NEW upload
-    await Campaign.findByIdAndUpdate(oldUpload.campaignId, {
-      uploadedCreative: result.secure_url,
-      updatedAt: new Date(),
-    });
-
-    // Clean up temp file
-    require("fs").unlinkSync(req.file.path);
-
-    res.json({ success: true, upload: newUpload });   // return the NEW upload
-  } catch (err) {
-    console.error("Replace upload error:", err);
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// Get uploads
-app.get('/api/uploads', async (req, res) => {
-  try {
-    const { campaignId, status } = req.query;
-    let query = {};
-    if (campaignId) query.campaignId = campaignId;
-    if (status) query.status = status;
-
-    const uploads = await Upload.find(query)
-      .populate('campaignId', 'campaignName organizationName description')
-      .sort({ createdAt: -1 });
-
-    const result = uploads.map(u => ({
-      ...u.toObject(),
-      campaign: u.campaignId,
-      campaignId: u.campaignId._id
-    }));
-
-    res.json({ success: true, uploads: result });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// Approve placement
-// Approve placement + set correct endDate
-app.put("/api/placements/:id/approve", async (req, res) => {
-  try {
-    const placement = await Placement.findById(req.params.id);
-    if (!placement) return res.status(404).json({ error: "Placement not found" });
-
-    const approvedAt = new Date();
-
-    // Calculate endDate = approvedAt + daysSelected days
-    const endDate = new Date(approvedAt);
-    endDate.setDate(endDate.getDate() + placement.daysSelected);
-
-    placement.status = "approved";
-    placement.approvedAt = approvedAt;
-    placement.endDate = endDate;           // ← THIS IS THE KEY
-    placement.reviewedAt = new Date();
-
-    await placement.save();
-
-    console.log(`✓ Placement approved → endDate set to ${endDate}`);
-
-    io.to("reviewers").emit("placement-updated", placement);
-
-    res.json({ success: true, placement });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// Decline placement
-app.put("/api/placements/:id/decline", async (req, res) => {
-  try {
-    const { reason } = req.body;
-    if (!reason) return res.status(400).json({ error: "Decline reason is required" });
-
-    const placement = await Placement.findById(req.params.id);
-    if (!placement) return res.status(404).json({ error: "Placement not found" });
-
-    placement.status = "rejected";
-    placement.reviewedAt = new Date();
-    placement.declineReason = reason;
-    placement.approvedAt = undefined;
-
-    await placement.save();
-
-    console.log("✓ Placement declined:", placement._id);
-
-    io.to("reviewers").emit("placement-updated", placement);
-
-    res.json({ success: true, placement });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-//======== PLACEMENTS =====
+// ====================== PLACEMENT ROUTES ======================
 
 app.post('/api/placements', auth, async (req, res) => {
   try {
@@ -715,23 +632,19 @@ app.post('/api/placements', auth, async (req, res) => {
       return res.status(400).json({ error: 'Missing required fields' });
     }
 
-    // Verify campaign belongs to user
     const campaign = await Campaign.findOne({ _id: campaignId, userId: req.user.userId });
     if (!campaign) {
       return res.status(404).json({ error: 'Campaign not found or unauthorized' });
     }
 
-    // Verify upload belongs to user
     const upload = await Upload.findOne({ _id: uploadId, userId: req.user.userId });
     if (!upload) {
       return res.status(404).json({ error: 'Upload not found or unauthorized' });
     }
 
-    // Compute endDate = startDate + daysSelected
     const endDate = new Date(startDate);
     endDate.setDate(endDate.getDate() + daysSelected);
 
-    // Expires for review (24h from now)
     const expiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000);
 
     const placement = new Placement({
@@ -751,7 +664,6 @@ app.post('/api/placements', auth, async (req, res) => {
 
     await placement.save();
 
-    // Emit socket event (optional)
     io.to('reviewers').emit('new-placement', placement);
 
     res.status(201).json({ success: true, placement });
@@ -761,33 +673,17 @@ app.post('/api/placements', auth, async (req, res) => {
   }
 });
 
-
-// ====================== GET PLACEMENTS (PUBLIC FOR TESTING) ======================
-// ====================== GET PLACEMENTS (FIXED) ======================
-// ====================== GET PLACEMENTS (WITH AUTO-EXPIRE from approvedAt) ======================
 app.get('/api/placements', optionalAuth, async (req, res) => {
   try {
-    // ────────────────────────────────────────────────
-    // AUTO-EXPIRE: based on approvedAt + daysSelected days
-    // ────────────────────────────────────────────────
-    const now = new Date();
     const expiredCount = await Placement.updateMany(
-      { 
-        status: 'approved', 
-        endDate: { $lt: new Date() } 
-      },
-      { 
-        $set: { status: 'completed', updatedAt: new Date() } 
-      }
+      { status: 'approved', endDate: { $lt: new Date() } },
+      { $set: { status: 'completed', updatedAt: new Date() } }
     );
 
     if (expiredCount.modifiedCount > 0) {
       console.log(`✅ Auto-expired ${expiredCount.modifiedCount} placements`);
     }
 
-    // ────────────────────────────────────────────────
-    // Normal query + filtering (unchanged)
-    // ────────────────────────────────────────────────
     const { status, campaignId, pinId } = req.query;
     let query = {};
 
@@ -849,10 +745,59 @@ app.get('/api/placements/:id', async (req, res) => {
   }
 });
 
+app.put("/api/placements/:id/approve", async (req, res) => {
+  try {
+    const placement = await Placement.findById(req.params.id);
+    if (!placement) return res.status(404).json({ error: "Placement not found" });
 
-// ====================== FAVORITES (FIXED) ======================
+    const approvedAt = new Date();
+    const endDate = new Date(approvedAt);
+    endDate.setDate(endDate.getDate() + placement.daysSelected);
 
-// ✅ FIXED: Favorites with all optional fields
+    placement.status = "approved";
+    placement.approvedAt = approvedAt;
+    placement.endDate = endDate;
+    placement.reviewedAt = new Date();
+
+    await placement.save();
+
+    console.log(`✓ Placement approved → endDate set to ${endDate}`);
+
+    io.to("reviewers").emit("placement-updated", placement);
+
+    res.json({ success: true, placement });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.put("/api/placements/:id/decline", async (req, res) => {
+  try {
+    const { reason } = req.body;
+    if (!reason) return res.status(400).json({ error: "Decline reason is required" });
+
+    const placement = await Placement.findById(req.params.id);
+    if (!placement) return res.status(404).json({ error: "Placement not found" });
+
+    placement.status = "rejected";
+    placement.reviewedAt = new Date();
+    placement.declineReason = reason;
+    placement.approvedAt = undefined;
+
+    await placement.save();
+
+    console.log("✓ Placement declined:", placement._id);
+
+    io.to("reviewers").emit("placement-updated", placement);
+
+    res.json({ success: true, placement });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ====================== FAVORITES ======================
+
 app.post("/api/favorites", auth, async (req, res) => {
   try {
     const { pinId, billboardId, latitude, longitude, address } = req.body;
@@ -863,10 +808,9 @@ app.post("/api/favorites", auth, async (req, res) => {
       return res.status(400).json({ error: "pinId is required" });
     }
 
-    // Check if already exists
     const existing = await Favorite.findOne({
       userId: req.user.userId,
-      pinId: pinId,
+      pinId,
     });
 
     if (existing) {
@@ -880,11 +824,11 @@ app.post("/api/favorites", auth, async (req, res) => {
 
     const favorite = new Favorite({
       userId: req.user.userId,
-      pinId: pinId,
-      billboardId: billboardId, // ✅ ADDED
-      latitude: latitude, // ✅ ADDED
-      longitude: longitude, // ✅ ADDED
-      address: address, // ✅ ADDED
+      pinId,
+      billboardId,
+      latitude,
+      longitude,
+      address,
     });
 
     await favorite.save();
@@ -938,8 +882,10 @@ app.get("/api/favorites", auth, async (req, res) => {
 
 // ====================== REFIT SYSTEM ======================
 
+// ── Constants ─────────────────────────────────────────────────────────────────
+
 const SUPPORTED_ASPECT_RATIOS = new Set([
-  "1:1", "1:4", "1:8", "2:3", "3:2", "3:4", "4:1", "4:3", 
+  "1:1", "1:4", "1:8", "2:3", "3:2", "3:4", "4:1", "4:3",
   "4:5", "5:4", "8:1", "9:16", "16:9", "21:9"
 ]);
 
@@ -956,6 +902,27 @@ const CRC32_TABLE = (() => {
   }
   return table;
 })();
+
+const DEFAULT_SYSTEM_PROMPT = `You are an expert billboard creative adapter. Analyze the source advertisement image and identify its visual hierarchy:
+
+1. PRIMARY FOCAL POINT: The main subject (product, person, or key visual element)
+2. SECONDARY ELEMENTS: Supporting text, taglines, pricing
+3. BRAND IDENTITY: Logos, brand names, social handles
+4. BACKGROUND: Colors, textures, ambient elements
+
+Your task:
+- Redesign the composition to fill the EXACT canvas dimensions provided
+- Preserve and EMPHASIZE the primary focal point — it must remain dominant and clear
+- Reposition secondary text so it reads naturally in the new aspect ratio
+- Keep logos and brand elements sharp and legible, never cropped
+- Extend or fill background intelligently — match colors, patterns, and lighting seamlessly
+- If upscaling is needed, preserve fine details and text crispness
+- Fill the entire canvas edge-to-edge. NO letterboxing, NO centered crops, NO empty borders
+- Maintain the original creative intent and brand aesthetic exactly
+
+Output high-fidelity, print-ready quality.`;
+
+// ── Utility functions ──────────────────────────────────────────────────────────
 
 function gcd(a, b) {
   let x = Math.abs(a);
@@ -1014,7 +981,7 @@ function generateBlankPngBase64(width, height) {
   ihdr[10] = 0;
   ihdr[11] = 0;
   ihdr[12] = 0;
-  
+
   const { deflateSync } = require("node:zlib");
   const png = Buffer.concat([
     PNG_SIGNATURE,
@@ -1025,28 +992,9 @@ function generateBlankPngBase64(width, height) {
   return png.toString("base64");
 }
 
-const DEFAULT_SYSTEM_PROMPT = `You are an expert billboard creative adapter. Analyze the source advertisement image and identify its visual hierarchy:
-
-1. PRIMARY FOCAL POINT: The main subject (product, person, or key visual element)
-2. SECONDARY ELEMENTS: Supporting text, taglines, pricing
-3. BRAND IDENTITY: Logos, brand names, social handles
-4. BACKGROUND: Colors, textures, ambient elements
-
-Your task:
-- Redesign the composition to fill the EXACT canvas dimensions provided
-- Preserve and EMPHASIZE the primary focal point — it must remain dominant and clear
-- Reposition secondary text so it reads naturally in the new aspect ratio
-- Keep logos and brand elements sharp and legible, never cropped
-- Extend or fill background intelligently — match colors, patterns, and lighting seamlessly
-- If upscaling is needed, preserve fine details and text crispness
-- Fill the entire canvas edge-to-edge. NO letterboxing, NO centered crops, NO empty borders
-- Maintain the original creative intent and brand aesthetic exactly
-
-Output high-fidelity, print-ready quality.`;
-
 function getImageDimensionsFromBase64(base64String) {
   const buffer = Buffer.from(base64String, 'base64');
-  
+
   // PNG
   if (buffer[0] === 0x89 && buffer[1] === 0x50) {
     return {
@@ -1055,7 +1003,7 @@ function getImageDimensionsFromBase64(base64String) {
       format: 'png'
     };
   }
-  
+
   // JPEG
   let offset = 0;
   while (offset < buffer.length) {
@@ -1070,69 +1018,375 @@ function getImageDimensionsFromBase64(base64String) {
     }
     offset++;
   }
-  
+
   return null;
 }
 
-// Gemini refit generation function
-async function generateRefitWithGemini(imageUrl, targetWidth, targetHeight, targetAspectRatio) {
+// ── Aspect ratio tolerance check ──────────────────────────────────────────────
+
+/**
+ * Checks whether targetWidth x targetHeight matches a supported aspect ratio
+ * exactly, within 5% tolerance, or not at all.
+ *
+ * Returns:
+ *   exactMatch        — true if simplified ratio is in SUPPORTED_ASPECT_RATIOS (0% error)
+ *   withinTolerance   — true if exactMatch OR closest supported ratio is within 5%
+ *   bestSupportedRatio — the closest supported ratio string to use in imageConfig
+ *   errorPct          — % error between target ratio and closest supported ratio
+ */
+function checkAspectRatioTolerance(targetWidth, targetHeight, tolerancePct = 5) {
+  const targetRatio = targetWidth / targetHeight;
+  const simplified = simplifyAspectRatio(targetWidth, targetHeight);
+  const exactMatch = SUPPORTED_ASPECT_RATIOS.has(simplified);
+
+  let bestMatch = null;
+  let bestError = Infinity;
+
+  for (const ratioStr of SUPPORTED_ASPECT_RATIOS) {
+    const [w, h] = ratioStr.split(":").map(Number);
+    const ratio = w / h;
+    const error = Math.abs(targetRatio - ratio) / targetRatio;
+    if (error < bestError) {
+      bestError = error;
+      bestMatch = ratioStr;
+    }
+  }
+
+  const errorPct = bestError * 100;
+  const withinTolerance = exactMatch || errorPct <= tolerancePct;
+
+  return {
+    exactMatch,
+    withinTolerance,
+    bestSupportedRatio: bestMatch,
+    errorPct: parseFloat(errorPct.toFixed(3)),
+  };
+}
+
+// ── Pure PNG scaler ────────────────────────────────────────────────────────────
+
+function decodePngToRgba(base64) {
+  const buffer = Buffer.from(base64, 'base64');
+
+  for (let i = 0; i < PNG_SIGNATURE.length; i++) {
+    if (buffer[i] !== PNG_SIGNATURE[i]) throw new Error('Not a valid PNG');
+  }
+
+  let offset = 8;
+  let width, height, colorType;
+  const idatChunks = [];
+
+  while (offset < buffer.length) {
+    const length = buffer.readUInt32BE(offset);
+    const type = buffer.toString('ascii', offset + 4, offset + 8);
+    const data = buffer.slice(offset + 8, offset + 8 + length);
+
+    if (type === 'IHDR') {
+      width = data.readUInt32BE(0);
+      height = data.readUInt32BE(4);
+      colorType = data[9];
+    } else if (type === 'IDAT') {
+      idatChunks.push(data);
+    } else if (type === 'IEND') {
+      break;
+    }
+
+    offset += 12 + length;
+  }
+
+  if (!width || !height) throw new Error('Failed to parse PNG IHDR');
+
+  const { inflateSync } = require('node:zlib');
+  const raw = inflateSync(Buffer.concat(idatChunks));
+
+  let bytesPerPixel;
+  switch (colorType) {
+    case 0: bytesPerPixel = 1; break; // grayscale
+    case 2: bytesPerPixel = 3; break; // RGB
+    case 3: bytesPerPixel = 1; break; // indexed
+    case 4: bytesPerPixel = 2; break; // grayscale+alpha
+    case 6: bytesPerPixel = 4; break; // RGBA
+    default: throw new Error(`Unsupported PNG color type: ${colorType}`);
+  }
+
+  const pixels = new Uint8Array(width * height * 4);
+  const stride = width * bytesPerPixel;
+
+  function paeth(a, b, c) {
+    const p = a + b - c;
+    const pa = Math.abs(p - a);
+    const pb = Math.abs(p - b);
+    const pc = Math.abs(p - c);
+    return pa <= pb && pa <= pc ? a : pb <= pc ? b : c;
+  }
+
+  let rawOffset = 0;
+  const prevRow = new Uint8Array(stride);
+
+  for (let y = 0; y < height; y++) {
+    const filterType = raw[rawOffset++];
+    const row = new Uint8Array(raw.buffer, raw.byteOffset + rawOffset, stride);
+    rawOffset += stride;
+
+    const currRow = new Uint8Array(stride);
+
+    for (let x = 0; x < stride; x++) {
+      const left = x >= bytesPerPixel ? currRow[x - bytesPerPixel] : 0;
+      const up = prevRow[x];
+      const upLeft = x >= bytesPerPixel ? prevRow[x - bytesPerPixel] : 0;
+
+      switch (filterType) {
+        case 0: currRow[x] = row[x]; break;
+        case 1: currRow[x] = (row[x] + left) & 0xff; break;
+        case 2: currRow[x] = (row[x] + up) & 0xff; break;
+        case 3: currRow[x] = (row[x] + ((left + up) >> 1)) & 0xff; break;
+        case 4: currRow[x] = (row[x] + paeth(left, up, upLeft)) & 0xff; break;
+        default: throw new Error(`Unknown PNG filter: ${filterType}`);
+      }
+    }
+
+    prevRow.set(currRow);
+
+    for (let x = 0; x < width; x++) {
+      const pxOffset = (y * width + x) * 4;
+      const srcOffset = x * bytesPerPixel;
+
+      switch (colorType) {
+        case 0:
+          pixels[pxOffset] = currRow[srcOffset];
+          pixels[pxOffset + 1] = currRow[srcOffset];
+          pixels[pxOffset + 2] = currRow[srcOffset];
+          pixels[pxOffset + 3] = 255;
+          break;
+        case 2:
+          pixels[pxOffset] = currRow[srcOffset];
+          pixels[pxOffset + 1] = currRow[srcOffset + 1];
+          pixels[pxOffset + 2] = currRow[srcOffset + 2];
+          pixels[pxOffset + 3] = 255;
+          break;
+        case 4:
+          pixels[pxOffset] = currRow[srcOffset];
+          pixels[pxOffset + 1] = currRow[srcOffset];
+          pixels[pxOffset + 2] = currRow[srcOffset];
+          pixels[pxOffset + 3] = currRow[srcOffset + 1];
+          break;
+        case 6:
+          pixels[pxOffset] = currRow[srcOffset];
+          pixels[pxOffset + 1] = currRow[srcOffset + 1];
+          pixels[pxOffset + 2] = currRow[srcOffset + 2];
+          pixels[pxOffset + 3] = currRow[srcOffset + 3];
+          break;
+      }
+    }
+  }
+
+  return { width, height, pixels };
+}
+
+function encodeRgbaToPng(pixels, width, height) {
+  const { deflateSync } = require('node:zlib');
+  const stride = width * 4;
+  const rawSize = height * (1 + stride);
+  const raw = Buffer.alloc(rawSize);
+
+  for (let y = 0; y < height; y++) {
+    const rowStart = y * (1 + stride);
+    raw[rowStart] = 0; // filter type: None
+    for (let x = 0; x < stride; x++) {
+      raw[rowStart + 1 + x] = pixels[y * stride + x];
+    }
+  }
+
+  const ihdr = Buffer.alloc(13);
+  ihdr.writeUInt32BE(width, 0);
+  ihdr.writeUInt32BE(height, 4);
+  ihdr[8] = 8;  // bit depth
+  ihdr[9] = 6;  // color type: RGBA
+  ihdr[10] = 0;
+  ihdr[11] = 0;
+  ihdr[12] = 0;
+
+  const png = Buffer.concat([
+    PNG_SIGNATURE,
+    createPngChunk('IHDR', ihdr),
+    createPngChunk('IDAT', deflateSync(raw)),
+    createPngChunk('IEND', Buffer.alloc(0)),
+  ]);
+
+  return png.toString('base64');
+}
+
+function sampleBilinear(pixels, srcWidth, srcHeight, sx, sy) {
+  const x0 = Math.floor(sx);
+  const y0 = Math.floor(sy);
+  const x1 = Math.min(x0 + 1, srcWidth - 1);
+  const y1 = Math.min(y0 + 1, srcHeight - 1);
+  const fx = sx - x0;
+  const fy = sy - y0;
+
+  const result = new Uint8Array(4);
+  for (let c = 0; c < 4; c++) {
+    const tl = pixels[(y0 * srcWidth + x0) * 4 + c];
+    const tr = pixels[(y0 * srcWidth + x1) * 4 + c];
+    const bl = pixels[(y1 * srcWidth + x0) * 4 + c];
+    const br = pixels[(y1 * srcWidth + x1) * 4 + c];
+    result[c] = Math.round(
+      tl * (1 - fx) * (1 - fy) +
+      tr * fx * (1 - fy) +
+      bl * (1 - fx) * fy +
+      br * fx * fy
+    );
+  }
+  return result;
+}
+
+/**
+ * Cover-scales srcBase64 PNG to fill targetWidth x targetHeight exactly.
+ * Composited onto a black canvas. Bilinear interpolation.
+ * Input/output: base64 PNG strings.
+ */
+function pngScaleToFit(srcBase64, targetWidth, targetHeight) {
+  const src = decodePngToRgba(srcBase64);
+
+  const scaleX = targetWidth / src.width;
+  const scaleY = targetHeight / src.height;
+  const scale = Math.max(scaleX, scaleY); // cover — no black bars
+
+  const scaledW = Math.round(src.width * scale);
+  const scaledH = Math.round(src.height * scale);
+
+  const offsetX = Math.round((targetWidth - scaledW) / 2);
+  const offsetY = Math.round((targetHeight - scaledH) / 2);
+
+  // Black opaque canvas
+  const output = new Uint8Array(targetWidth * targetHeight * 4);
+  for (let i = 0; i < output.length; i += 4) {
+    output[i] = 0;
+    output[i + 1] = 0;
+    output[i + 2] = 0;
+    output[i + 3] = 255;
+  }
+
+  for (let y = 0; y < targetHeight; y++) {
+    for (let x = 0; x < targetWidth; x++) {
+      const sx = (x - offsetX) / scale;
+      const sy = (y - offsetY) / scale;
+
+      if (sx < 0 || sy < 0 || sx >= src.width || sy >= src.height) continue;
+
+      const sample = sampleBilinear(src.pixels, src.width, src.height, sx, sy);
+      const outIdx = (y * targetWidth + x) * 4;
+      output[outIdx]     = sample[0];
+      output[outIdx + 1] = sample[1];
+      output[outIdx + 2] = sample[2];
+      output[outIdx + 3] = sample[3];
+    }
+  }
+
+  return encodeRgbaToPng(output, targetWidth, targetHeight);
+}
+
+// ── Cloudinary upload helper ───────────────────────────────────────────────────
+
+async function uploadRefitToCloudinary(imageBase64, mimeType, publicIdPrefix) {
+  const { v4: uuidv4 } = require('uuid');
+  const fs = require('fs');
+  const tempPath = `uploads/refit_${uuidv4()}.png`;
+
+  fs.writeFileSync(tempPath, Buffer.from(imageBase64, 'base64'));
+
+  try {
+    const result = await cloudinary.uploader.upload(tempPath, {
+      folder: "refits",
+      public_id: `${publicIdPrefix}_refit_${Date.now()}`,
+      resource_type: "image",
+    });
+
+    fs.unlinkSync(tempPath);
+
+    return {
+      cloudinaryUrl: result.secure_url,
+      publicId: result.public_id,
+      dimensions: { width: result.width, height: result.height },
+    };
+  } catch (err) {
+    if (require('fs').existsSync(tempPath)) require('fs').unlinkSync(tempPath);
+    throw err;
+  }
+}
+
+// ── Core Gemini refit function ─────────────────────────────────────────────────
+
+async function generateRefitWithGemini(imageUrl, targetWidth, targetHeight) {
   const apiKey = process.env.GEMINI_API_KEY;
 
-  
-  // Download image from URL
+  // Download source image
   const imageResponse = await fetch(imageUrl);
-  if (!imageResponse.ok) {
-    throw new Error(`Failed to download image: ${imageResponse.status}`);
-  }
-  const imageBuffer = Buffer.from(await imageResponse.arrayBuffer());
-  const imageBase64 = imageBuffer.toString('base64');
+  if (!imageResponse.ok) throw new Error(`Failed to download image: ${imageResponse.status}`);
+  const imageBase64 = Buffer.from(await imageResponse.arrayBuffer()).toString('base64');
   const mimeType = imageResponse.headers.get('content-type') || 'image/jpeg';
-  
-  // Check if aspect ratio is natively supported
-  const requestedAspectRatio = simplifyAspectRatio(targetWidth, targetHeight);
-  const useReferenceCanvasFallback = !SUPPORTED_ASPECT_RATIOS.has(requestedAspectRatio);
-  
-  // Generate reference canvas for non-standard aspect ratios
-  const referenceCanvas = useReferenceCanvasFallback 
-    ? getReferenceCanvasDimensions(targetWidth, targetHeight) 
-    : null;
-  const blankBase64 = referenceCanvas 
-    ? generateBlankPngBase64(referenceCanvas.width, referenceCanvas.height) 
-    : null;
-  
-  const finalPrompt = `${DEFAULT_SYSTEM_PROMPT}
 
-Target output size: ${targetWidth}x${targetHeight}px.${
-    referenceCanvas
-      ? ` The last image is a blank black reference canvas sized ${referenceCanvas.width}x${referenceCanvas.height}px. Use it as the exact composition guide and aspect ratio.`
-      : ""
-  }`;
+  // ── STEP 1: Check aspect ratio tolerance ──────────────────────────────────
+  const ratioCheck = checkAspectRatioTolerance(targetWidth, targetHeight, 5);
 
   console.log("=== GEMINI REFIT REQUEST ===");
   console.log("Target:", targetWidth, "x", targetHeight);
-  console.log("Aspect ratio:", requestedAspectRatio);
-  console.log("Using canvas fallback:", useReferenceCanvasFallback);
+  console.log("Requested ratio:", simplifyAspectRatio(targetWidth, targetHeight));
+  console.log("Exact match:", ratioCheck.exactMatch);
+  console.log("Within 5% tolerance:", ratioCheck.withinTolerance);
+  console.log("Closest supported ratio:", ratioCheck.bestSupportedRatio);
+  console.log("Error from closest:", ratioCheck.errorPct.toFixed(2) + "%");
+  console.log("Generation path:", ratioCheck.withinTolerance ? "NATIVE (4K + imageConfig)" : "CANVAS FALLBACK");
+  console.log("PNG refix:", ratioCheck.exactMatch ? "SKIP (exact match)" : "WILL RUN");
 
-  const requestParts = [
-    { inlineData: { mimeType, data: imageBase64 } },
-  ];
+  // ── STEP 2: Build request body ────────────────────────────────────────────
+  let requestBody;
 
-  if (blankBase64) {
-    requestParts.push({
-      inlineData: { mimeType: "image/png", data: blankBase64 },
-    });
+  if (ratioCheck.withinTolerance) {
+    // Native path: use imageConfig with closest supported ratio + 4K quality
+    const finalPrompt = `${DEFAULT_SYSTEM_PROMPT}
+
+Target output size: ${targetWidth}x${targetHeight}px (${ratioCheck.bestSupportedRatio}).
+Fill the canvas edge-to-edge with no borders.`;
+
+    requestBody = {
+      contents: [{ role: "user", parts: [
+        { inlineData: { mimeType, data: imageBase64 } },
+        { text: finalPrompt },
+      ]}],
+      generationConfig: {
+        responseModalities: ["IMAGE"],
+        imageConfig: {
+          aspectRatio: ratioCheck.bestSupportedRatio,
+          outputQuality: "QUALITY",
+        },
+      },
+    };
+
+  } else {
+    // Canvas path: send blank PNG reference to guide composition
+    const referenceCanvas = getReferenceCanvasDimensions(targetWidth, targetHeight);
+    const blankBase64 = generateBlankPngBase64(referenceCanvas.width, referenceCanvas.height);
+
+    const finalPrompt = `${DEFAULT_SYSTEM_PROMPT}
+
+Target output size: ${targetWidth}x${targetHeight}px.
+The last image is a blank black reference canvas sized ${referenceCanvas.width}x${referenceCanvas.height}px. Use it as the exact composition guide and aspect ratio.`;
+
+    requestBody = {
+      contents: [{ role: "user", parts: [
+        { inlineData: { mimeType, data: imageBase64 } },
+        { inlineData: { mimeType: "image/png", data: blankBase64 } },
+        { text: finalPrompt },
+      ]}],
+      generationConfig: {
+        responseModalities: ["IMAGE"],
+        // No imageConfig — canvas method only
+      },
+    };
   }
 
-  requestParts.push({ text: finalPrompt });
-
- const requestBody = {
-  contents: [{ role: "user", parts: requestParts }],
-  generationConfig: {
-    responseModalities: ["IMAGE"]
-    // NO imageConfig at all - canvas method only
-  }
-};
-
+  // ── STEP 3: Call Gemini ───────────────────────────────────────────────────
   const projectId = "project-b275f288-bac3-429e-877";
   const region = "global";
   const model = "gemini-3-pro-image-preview";
@@ -1152,70 +1406,63 @@ Target output size: ${targetWidth}x${targetHeight}px.${
   }
 
   const result = await response.json();
-  
-  if (!result.candidates?.[0]?.content?.parts) {
-    throw new Error("No content in Gemini response");
-  }
+  if (!result.candidates?.[0]?.content?.parts) throw new Error("No content in Gemini response");
 
-  // Find image in response
+  // ── STEP 4: Extract generated image ──────────────────────────────────────
+  let generatedBase64 = null;
+  let generatedMime = 'image/png';
+
   for (const part of result.candidates[0].content.parts) {
     if (part.inlineData) {
-      return {
-        imageBase64: part.inlineData.data,
-        mimeType: part.inlineData.mimeType || "image/png",
-        aspectRatio: requestedAspectRatio,
-        width: targetWidth,
-        height: targetHeight,
-      };
+      generatedBase64 = part.inlineData.data;
+      generatedMime = part.inlineData.mimeType || 'image/png';
+      break;
     }
   }
 
-  throw new Error("No image generated by Gemini");
-}
+  if (!generatedBase64) throw new Error('No image generated by Gemini');
 
-// Upload refit image to Cloudinary
-async function uploadRefitToCloudinary(imageBase64, mimeType, publicIdPrefix) {
-  const { v4: uuidv4 } = require('uuid');
-  const tempFileName = `refit_${uuidv4()}.png`;
-  const tempPath = `uploads/${tempFileName}`;
-  
-  // Save base64 to temp file
-  const fs = require('fs');
-  const buffer = Buffer.from(imageBase64, 'base64');
-  fs.writeFileSync(tempPath, buffer);
-  
-  try {
-    // Upload to Cloudinary
-    const result = await cloudinary.uploader.upload(tempPath, {
-      folder: "refits",
-      public_id: `${publicIdPrefix}_refit_${Date.now()}`,
-      resource_type: "image",
-    });
-    
-    // Clean up temp file
-    fs.unlinkSync(tempPath);
-    
-    return {
-      cloudinaryUrl: result.secure_url,
-      publicId: result.public_id,
-      dimensions: { width: result.width, height: result.height },
-    };
-  } catch (err) {
-    // Clean up on error
-    if (fs.existsSync(tempPath)) fs.unlinkSync(tempPath);
-    throw err;
+  // ── STEP 5: PNG refix ─────────────────────────────────────────────────────
+  // Exact native match → Gemini already output correct ratio, skip refix.
+  // Approximated native (within 5%) → refix to exact target dims.
+  // Canvas method (>5%) → refix to exact target dims.
+  let finalBase64 = generatedBase64;
+  const needsRefix = !ratioCheck.exactMatch;
+
+  if (needsRefix) {
+    const reason = !ratioCheck.withinTolerance ? 'canvas method' : 'approximated native ratio';
+    console.log(`🖼  Running PNG refix (reason: ${reason})...`);
+
+    if (generatedMime.includes('png')) {
+      finalBase64 = pngScaleToFit(generatedBase64, targetWidth, targetHeight);
+      console.log('✅ PNG refix complete');
+    } else {
+      console.warn('⚠️  Non-PNG output from Gemini — skipping refix');
+    }
+  } else {
+    console.log('✅ Exact native match — no refix needed');
   }
+
+  return {
+    imageBase64: finalBase64,
+    mimeType: 'image/png',
+    aspectRatio: simplifyAspectRatio(targetWidth, targetHeight),
+    width: targetWidth,
+    height: targetHeight,
+    ratioPath: ratioCheck.withinTolerance ? 'native' : 'canvas',
+    refixApplied: needsRefix,
+  };
 }
 
 // ====================== REFIT ENDPOINTS ======================
 
-// TEST ENDPOINT: Simple image + target dimensions
+// AUTH TEST ENDPOINT — full Gemini flow, takes Cloudinary URL
 // POST /api/refit/test
-// Body: { imageUrl: string, targetWidth: number, targetHeight: number }
+// Body: { imageUrl, targetWidth, targetHeight }
 app.post('/api/refit/test', auth, async (req, res) => {
   try {
     const { imageUrl, targetWidth, targetHeight } = req.body;
-    
+
     if (!imageUrl || !targetWidth || !targetHeight) {
       return res.status(400).json({ error: 'Missing imageUrl, targetWidth, or targetHeight' });
     }
@@ -1224,15 +1471,12 @@ app.post('/api/refit/test', auth, async (req, res) => {
     console.log("Image:", imageUrl);
     console.log("Target:", targetWidth, "x", targetHeight);
 
-    // Generate refit with Gemini (always uses canvas method for testing)
     const refitResult = await generateRefitWithGemini(
-      imageUrl, 
-      parseInt(targetWidth), 
-      parseInt(targetHeight),
-      simplifyAspectRatio(parseInt(targetWidth), parseInt(targetHeight))
+      imageUrl,
+      parseInt(targetWidth),
+      parseInt(targetHeight)
     );
 
-    // Upload result to Cloudinary
     const cloudinaryResult = await uploadRefitToCloudinary(
       refitResult.imageBase64,
       refitResult.mimeType,
@@ -1246,6 +1490,8 @@ app.post('/api/refit/test', auth, async (req, res) => {
         publicId: cloudinaryResult.publicId,
         dimensions: cloudinaryResult.dimensions,
         aspectRatio: refitResult.aspectRatio,
+        ratioPath: refitResult.ratioPath,
+        refixApplied: refitResult.refixApplied,
       }
     });
 
@@ -1255,18 +1501,17 @@ app.post('/api/refit/test', auth, async (req, res) => {
   }
 });
 
-// PREVIEW ENDPOINT: Generate refit and update upload
+// PREVIEW ENDPOINT — generate refit and cache on upload
 // POST /api/refit/preview
-// Body: { uploadId: string, targetWidth: number, targetHeight: number }
+// Body: { uploadId, targetWidth, targetHeight }
 app.post('/api/refit/preview', auth, async (req, res) => {
   try {
     const { uploadId, targetWidth, targetHeight } = req.body;
-    
+
     if (!uploadId || !targetWidth || !targetHeight) {
       return res.status(400).json({ error: 'Missing uploadId, targetWidth, or targetHeight' });
     }
 
-    // Get upload
     const upload = await Upload.findOne({ _id: uploadId, userId: req.user.userId });
     if (!upload) {
       return res.status(404).json({ error: 'Upload not found' });
@@ -1274,32 +1519,24 @@ app.post('/api/refit/preview', auth, async (req, res) => {
 
     const targetAspectRatio = simplifyAspectRatio(parseInt(targetWidth), parseInt(targetHeight));
 
-    // Check if refit already exists
+    // Return cached refit if it exists
     if (upload.refits?.has(targetAspectRatio)) {
       const existing = upload.refits.get(targetAspectRatio);
-      return json({
-        success: true,
-        refit: existing,
-        cached: true
-      });
+      return res.json({ success: true, refit: existing, cached: true });
     }
 
-    // Generate refit
     const refitResult = await generateRefitWithGemini(
       upload.cloudinaryUrl,
       parseInt(targetWidth),
-      parseInt(targetHeight),
-      targetAspectRatio
+      parseInt(targetHeight)
     );
 
-    // Upload to Cloudinary
     const cloudinaryResult = await uploadRefitToCloudinary(
       refitResult.imageBase64,
       refitResult.mimeType,
       upload.publicId
     );
 
-    // Save refit to upload
     const refitData = {
       cloudinaryUrl: cloudinaryResult.cloudinaryUrl,
       publicId: cloudinaryResult.publicId,
@@ -1310,11 +1547,7 @@ app.post('/api/refit/preview', auth, async (req, res) => {
     upload.refits.set(targetAspectRatio, refitData);
     await upload.save();
 
-    res.json({
-      success: true,
-      refit: refitData,
-      cached: false
-    });
+    res.json({ success: true, refit: refitData, cached: false });
 
   } catch (err) {
     console.error("Refit preview error:", err);
@@ -1322,24 +1555,22 @@ app.post('/api/refit/preview', auth, async (req, res) => {
   }
 });
 
-// PLACEMENT ENDPOINT: Generate refit, update upload and placement
+// PLACEMENT ENDPOINT — generate refit, cache on upload, update placement
 // POST /api/refit/placement
-// Body: { placementId: string, targetWidth: number, targetHeight: number }
+// Body: { placementId, targetWidth, targetHeight }
 app.post('/api/refit/placement', auth, async (req, res) => {
   try {
     const { placementId, targetWidth, targetHeight } = req.body;
-    
+
     if (!placementId || !targetWidth || !targetHeight) {
       return res.status(400).json({ error: 'Missing placementId, targetWidth, or targetHeight' });
     }
 
-    // Get placement
     const placement = await Placement.findOne({ _id: placementId, userId: req.user.userId });
     if (!placement) {
       return res.status(404).json({ error: 'Placement not found' });
     }
 
-    // Get upload
     const upload = await Upload.findOne({ _id: placement.uploadId, userId: req.user.userId });
     if (!upload) {
       return res.status(404).json({ error: 'Upload not found' });
@@ -1347,17 +1578,14 @@ app.post('/api/refit/placement', auth, async (req, res) => {
 
     const targetAspectRatio = simplifyAspectRatio(parseInt(targetWidth), parseInt(targetHeight));
 
-    // Generate refit (or use existing)
     let refitData;
     if (upload.refits?.has(targetAspectRatio)) {
       refitData = upload.refits.get(targetAspectRatio);
     } else {
-      // Generate new refit
       const refitResult = await generateRefitWithGemini(
         upload.cloudinaryUrl,
         parseInt(targetWidth),
-        parseInt(targetHeight),
-        targetAspectRatio
+        parseInt(targetHeight)
       );
 
       const cloudinaryResult = await uploadRefitToCloudinary(
@@ -1377,11 +1605,7 @@ app.post('/api/refit/placement', auth, async (req, res) => {
       await upload.save();
     }
 
-    // Update placement - set refitSize and status to completed
-    placement.refitSize = {
-      size: targetAspectRatio,
-      status: 'completed'
-    };
+    placement.refitSize = { size: targetAspectRatio, status: 'completed' };
     await placement.save();
 
     res.json({
@@ -1399,163 +1623,74 @@ app.post('/api/refit/placement', auth, async (req, res) => {
   }
 });
 
-// ===// ====================== SIMPLE REFIT TEST (NO AUTH) ======================
-
-console.log("📝 Registering refit endpoints...");
-
-const uploadMemory = multer({ storage: multer.memoryStorage() });
-
-// Health check
-app.get('/api/refit/health', (req, res) => {
-  console.log("✅ Health check hit");
-  res.json({ status: 'ok', timestamp: new Date().toISOString() });
-});
-
-// Simple test endpoint
-app.post('/api/refit/simple-test', uploadMemory.single('image'), async (req, res) => {
+// PNG SCALE TEST (NO AUTH) — test pure PNG scaler in isolation, no Gemini
+// POST /api/refit/png-scale-test
+// multipart: image (PNG file), targetWidth, targetHeight
+app.post('/api/refit/png-scale-test', uploadMemory.single('image'), async (req, res) => {
   try {
-    const apiKey = process.env.GEMINI_API_KEY;
-    if (!apiKey) {
-      return res.status(500).json({ error: 'GEMINI_API_KEY not set' });
-    }
-
     if (!req.file) {
       return res.status(400).json({ error: 'No image file uploaded' });
     }
 
-    const targetWidth = parseInt(req.body.targetWidth) || 1920;
-    const targetHeight = parseInt(req.body.targetHeight) || 1080;
+    if (!req.file.mimetype.includes('png')) {
+      return res.status(400).json({ error: 'Input must be PNG for this endpoint' });
+    }
 
-    console.log("\n========================================");
-    console.log("🔥 REFIT REQUEST");
-    console.log("========================================");
-    console.log("Original file:", req.file.originalname);
-    console.log("Original size:", req.file.size, "bytes");
-    console.log("Original mime:", req.file.mimetype);
-    console.log("Target dimensions:", targetWidth, "x", targetHeight);
+    const targetWidth = parseInt(req.body.targetWidth);
+    const targetHeight = parseInt(req.body.targetHeight);
 
-    const imageBase64 = req.file.buffer.toString('base64');
-    const mimeType = req.file.mimetype || 'image/jpeg';
+    if (!targetWidth || !targetHeight || targetWidth < 1 || targetHeight < 1) {
+      return res.status(400).json({ error: 'Invalid targetWidth or targetHeight' });
+    }
 
-    // ALWAYS use canvas method - no native aspect ratio support
-    const referenceCanvas = getReferenceCanvasDimensions(targetWidth, targetHeight);
-    const blankBase64 = generateBlankPngBase64(referenceCanvas.width, referenceCanvas.height);
-    
-    const targetAspectRatio = simplifyAspectRatio(targetWidth, targetHeight);
-    
-    console.log("Target aspect ratio:", targetAspectRatio);
-    console.log("Reference canvas:", referenceCanvas.width, "x", referenceCanvas.height);
+    console.log('\n========================================');
+    console.log('🔬 PNG SCALE TEST');
+    console.log('========================================');
+    console.log('File:', req.file.originalname, '|', req.file.size, 'bytes');
+    console.log('Target:', targetWidth, 'x', targetHeight);
 
-    const finalPrompt = `${DEFAULT_SYSTEM_PROMPT}
+    const srcBase64 = req.file.buffer.toString('base64');
+    const inputDims = getImageDimensionsFromBase64(srcBase64);
+    console.log('Input dims:', inputDims?.width, 'x', inputDims?.height);
 
-Target canvas: ${targetWidth}x${targetHeight}px (${targetAspectRatio}).
-The last image is a blank reference canvas sized ${referenceCanvas.width}x${referenceCanvas.height}px. Use it as the exact composition guide.`;
-
-    const requestParts = [
-      { inlineData: { mimeType, data: imageBase64 } },
-      { inlineData: { mimeType: "image/png", data: blankBase64 } },
-      { text: finalPrompt }
-    ];
-
-    const requestBody = {
-      contents: [{ role: "user", parts: requestParts }],
-      generationConfig: {
-        responseModalities: ["IMAGE"]
-        // NO imageConfig - canvas only
-      }
-    };
-
-    console.log("\n⏳ Sending to Gemini...");
     const startTime = Date.now();
+    const scaledBase64 = pngScaleToFit(srcBase64, targetWidth, targetHeight);
+    const processingMs = Date.now() - startTime;
 
-    const projectId = "project-b275f288-bac3-429e-877";
-    const region = "global";
-    const model = "gemini-3-pro-image-preview";
+    const outputDims = getImageDimensionsFromBase64(scaledBase64);
+    console.log('Output dims:', outputDims?.width, 'x', outputDims?.height);
+    console.log('Time:', processingMs + 'ms');
 
-    const response = await fetch(
-      `https://aiplatform.googleapis.com/v1/projects/${projectId}/locations/${region}/publishers/google/models/${model}:generateContent?key=${apiKey}`,
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(requestBody),
+    res.json({
+      success: true,
+      result: {
+        imageBase64: scaledBase64,
+        mimeType: 'image/png',
+        dataUrl: `data:image/png;base64,${scaledBase64}`,
+        input: {
+          width: inputDims?.width,
+          height: inputDims?.height,
+          aspectRatio: inputDims ? (inputDims.width / inputDims.height).toFixed(4) : null,
+        },
+        output: {
+          width: outputDims?.width,
+          height: outputDims?.height,
+          aspectRatio: outputDims ? (outputDims.width / outputDims.height).toFixed(4) : null,
+        },
+        target: {
+          width: targetWidth,
+          height: targetHeight,
+          aspectRatio: (targetWidth / targetHeight).toFixed(4),
+        },
+        processingMs,
       }
-    );
-
-    const duration = Date.now() - startTime;
-    console.log("Gemini response status:", response.status);
-    console.log("Gemini response time:", duration + "ms");
-
-    if (!response.ok) {
-      const errorText = await response.text();
-      console.error("❌ Gemini error:", errorText);
-      throw new Error(`Gemini API error (${response.status})`);
-    }
-
-    const result = await response.json();
-    const candidate = result.candidates?.[0];
-    const parts = candidate?.content?.parts;
-
-    console.log("Candidates:", result.candidates?.length);
-    console.log("Finish reason:", candidate?.finishReason);
-
-    if (!parts) {
-      throw new Error("No content parts in response");
-    }
-
-    for (const part of parts) {
-      if (part.inlineData) {
-        const generatedBase64 = part.inlineData.data;
-        const generatedMime = part.inlineData.mimeType || "image/png";
-        
-        // LOG ACTUAL OUTPUT DIMENSIONS
-        const dims = getImageDimensionsFromBase64(generatedBase64);
-        if (dims) {
-          const generatedRatio = (dims.width / dims.height).toFixed(4);
-          const targetRatio = (targetWidth / targetHeight).toFixed(4);
-          const ratioDiff = Math.abs(parseFloat(generatedRatio) - parseFloat(targetRatio)).toFixed(4);
-          
-          console.log("\n📐 OUTPUT ANALYSIS");
-          console.log("----------------------------------------");
-          console.log("Output format:", dims.format);
-          console.log("Output width:", dims.width);
-          console.log("Output height:", dims.height);
-          console.log("Output aspect ratio:", generatedRatio);
-          console.log("Target aspect ratio:", targetRatio);
-          console.log("Ratio difference:", ratioDiff);
-          console.log("Ratio match:", ratioDiff < 0.05 ? "✅ PASS" : "⚠️ DRIFT");
-          console.log("----------------------------------------\n");
-        }
-
-        const dataUrl = `data:${generatedMime};base64,${generatedBase64}`;
-
-        return res.json({
-          success: true,
-          result: {
-            imageBase64: generatedBase64,
-            mimeType: generatedMime,
-            dataUrl: dataUrl,
-            targetWidth,
-            targetHeight,
-            targetAspectRatio,
-            outputWidth: dims?.width,
-            outputHeight: dims?.height,
-            outputAspectRatio: dims ? (dims.width / dims.height).toFixed(4) : null
-          }
-        });
-      }
-    }
-
-    throw new Error("No image in response");
+    });
 
   } catch (err) {
-    console.error("❌ Endpoint error:", err);
+    console.error('❌ PNG scale test error:', err);
     res.status(500).json({ error: err.message });
   }
 });
-
-console.log("✅ Refit endpoints registered");
-
-
 
 // ====================== START SERVER ======================
 
