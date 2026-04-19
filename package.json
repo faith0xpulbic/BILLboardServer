@@ -18,7 +18,8 @@
     "mongoose": "^8.12.1",
     "multer": "^2.0.2",
     "node-cache": "^5.1.2",
-    "socket.io": "^4.8.1"
+    "socket.io": "^4.8.1",
+    "uuid": "^11.0.0"
   },
   "devDependencies": {
     "nodemon": "^3.1.9"
