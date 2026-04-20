@@ -143,12 +143,8 @@ const Favorite = mongoose.model(
       userId: { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true },
       pinId: { type: String, required: true },
       collection: {
-        type: String,
-        enum: ["favorites", "collection"],
-        required: true,
-        default: "favorites",
+        name: { type: String, required: true, default: "Favorites" },
       },
-      name: { type: String, required: true, default: "Favorites" },
       billboardId: String,
       latitude: Number,
       longitude: Number,
@@ -158,6 +154,7 @@ const Favorite = mongoose.model(
   ),
 );
 
+Favorite.schema.index({ userId: 1, pinId: 1, "collection.name": 1 }, { unique: true });
 // Prevent duplicates inside the same collection, but allow the same pin in multiple collections.
 Favorite.schema.index({ userId: 1, pinId: 1, collection: 1, name: 1 }, { unique: true });
 
@@ -809,35 +806,20 @@ app.put("/api/placements/:id/decline", async (req, res) => {
 
 app.post("/api/favorites", auth, async (req, res) => {
   try {
-    const {
-      pinId,
-      collection = "favorites",
-      name = "Favorites",
-      billboardId,
-      latitude,
-      longitude,
-      address,
-    } = req.body;
-
-    console.log("📥 Received favorite request:", { pinId, collection, name });
+    const { pinId, billboardId, latitude, longitude, address } = req.body;
+    const collectionName = req.body?.collection?.name || req.body?.name || "Favorites";
 
     if (!pinId) {
       return res.status(400).json({ error: "pinId is required" });
     }
 
-    if (!collection || !name) {
-      return res.status(400).json({ error: "collection and name are required" });
-    }
-
     const existing = await Favorite.findOne({
       userId: req.user.userId,
       pinId,
-      collection,
-      name,
+      "collection.name": collectionName,
     });
 
     if (existing) {
-      console.log("⚠ Already saved in this collection:", pinId, collection, name);
       return res.status(200).json({
         success: true,
         message: "Already saved",
@@ -848,8 +830,7 @@ app.post("/api/favorites", auth, async (req, res) => {
     const favorite = new Favorite({
       userId: req.user.userId,
       pinId,
-      collection,
-      name,
+      collection: { name: collectionName },
       billboardId,
       latitude,
       longitude,
@@ -857,68 +838,45 @@ app.post("/api/favorites", auth, async (req, res) => {
     });
 
     await favorite.save();
-
-    console.log("✓ Favorite saved:", favorite._id);
-    
     res.status(201).json({ success: true, favorite });
   } catch (err) {
-    console.error("Favorite error:", err);
-
     if (err.code === 11000) {
       return res.status(400).json({ error: "Already saved in this collection" });
     }
-
     res.status(500).json({ error: err.message });
   }
 });
 
+
 app.delete("/api/favorites/:pinId", auth, async (req, res) => {
   try {
-    const { collection, name } = req.query;
+    const collectionName = req.query.name || "Favorites";
 
-    console.log("📥 Delete favorite request:", {
-      pinId: req.params.pinId,
-      collection,
-      name,
-    });
-
-    const filter = {
+    const result = await Favorite.findOneAndDelete({
       userId: req.user.userId,
       pinId: req.params.pinId,
-    };
-
-    if (collection) filter.collection = collection;
-    if (name) filter.name = name;
-
-    const result = await Favorite.findOneAndDelete(filter);
+      "collection.name": collectionName,
+    });
 
     if (!result) {
-      console.log("⚠ Favorite not found:", req.params.pinId);
       return res.status(404).json({ error: "Favorite not found" });
     }
 
-    console.log("✓ Favorite removed:", req.params.pinId);
-
-    res.json({ success: true, message: "Removed from favorites" });
+    res.json({ success: true, message: "Removed" });
   } catch (err) {
-    console.error("Delete favorite error:", err);
     res.status(500).json({ error: err.message });
   }
 });
 
 app.get("/api/favorites", auth, async (req, res) => {
   try {
-    const { collection, name } = req.query;
-
     const filter = { userId: req.user.userId };
 
-    if (collection) filter.collection = collection;
-    if (name) filter.name = name;
+    if (req.query.name) {
+      filter["collection.name"] = req.query.name;
+    }
 
     const favorites = await Favorite.find(filter).sort({ createdAt: -1 });
-
-    console.log(`✓ Fetched ${favorites.length} favorites`);
-
     res.json({ success: true, favorites });
   } catch (err) {
     res.status(500).json({ error: err.message });
