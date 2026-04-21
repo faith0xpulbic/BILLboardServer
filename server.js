@@ -925,6 +925,25 @@ Your task:
 
 Output high-fidelity, print-ready quality.`;
 
+const NATIVE_PATH_SYSTEM_PROMPT = `You are an expert billboard creative adapter. Analyze the source advertisement image and identify its visual hierarchy:
+
+1. PRIMARY FOCAL POINT: The main subject (product, person, or key visual element)
+2. SECONDARY ELEMENTS: Supporting text, taglines, pricing
+3. BRAND IDENTITY: Logos, brand names, social handles
+4. BACKGROUND: Colors, textures, ambient elements
+
+Your task:
+- Redesign the composition to Expand EXACTLY t the newly Requested Aspect ratio 
+- Preserve and EMPHASIZE the primary focal point — it must remain dominant and clear
+- Reposition secondary text so it reads naturally in the new aspect ratio
+- Keep logos and brand elements sharp and legible, never cropped
+- Extend or fill intelligently — match colors, patterns, and lighting seamlessly
+- If upscaling is needed, preserve fine details and text crispness
+- Fill the entirety to the new aspect ratio edge-to-edge. NO letterboxing, NO centered crops, NO black borders
+- Maintain the original creative intent and brand aesthetic exactly
+Output high-fidelity, print-ready quality.`;
+
+
 // ── Utility functions ──────────────────────────────────────────────────────────
 
 function gcd(a, b) {
@@ -1347,7 +1366,7 @@ async function generateRefitWithGemini(imageUrl, targetWidth, targetHeight) {
 
   if (ratioCheck.withinTolerance) {
     // Native path: use imageConfig with closest supported ratio + 4K quality
-    const finalPrompt = `${DEFAULT_SYSTEM_PROMPT}
+    const finalPrompt = `${NATIVE_PATH_SYSTEM_PROMPT}
 
 Target output size: ${targetWidth}x${targetHeight}px (${ratioCheck.bestSupportedRatio}).
 Fill the canvas edge-to-edge with no borders.`;
@@ -1361,7 +1380,7 @@ Fill the canvas edge-to-edge with no borders.`;
         responseModalities: ["IMAGE"],
         imageConfig: {
           aspectRatio: ratioCheck.bestSupportedRatio,
-          outputQuality: "QUALITY",
+          imageSize: "2k",
         },
       },
     };
