@@ -131,12 +131,12 @@ const Upload = mongoose.model(
       declineReason: String,
       refits: {
         type: Map,
-        of: new mongoose.Schema({
-          cloudinaryUrl: { type: String, required: true },
-          publicId: { type: String, required: true },
+        of: {
+          cloudinaryUrl: String,
+          publicId: String,
           dimensions: { width: Number, height: Number },
-          createdAt: { type: Date, default: Date.now }
-        }, { _id: false }),
+          createdAt: Date
+        },
         default: new Map()
       }
     },
