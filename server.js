@@ -66,6 +66,14 @@ const Pin = mongoose.model(
     addressShort: String,
     description: String,
     available: { type: Boolean, default: false },
+    referenceId: String,            // <-- new
+    gisData: {                      // <-- new
+      population: Number,
+      environment: String,
+      location: String,
+      attributes: [String],
+      rwi: Number
+    }
   }),
 );
 
