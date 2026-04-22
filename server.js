@@ -66,15 +66,18 @@ const Pin = mongoose.model(
     addressShort: String,
     description: String,
     available: { type: Boolean, default: false },
-    referenceId: String,            // <-- new
-    gisData: {                      // <-- new
-      population: Number,
-      environment: String,
-      location: String,
-      attributes: [String],
-      rwi: Number
-    }
-  }),
+    referenceId: String,
+    gisData: {
+      type: {
+        population: Number,
+        environment: String,
+        location: String,
+        attributes: { type: [String], default: undefined },
+        rwi: Number,
+      },
+      default: undefined,
+    },
+  }, { strict: false })  // <-- add this
 );
 
 const User = mongoose.model(
