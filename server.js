@@ -163,8 +163,7 @@ const Favorite = mongoose.model(
 );
 
 Favorite.schema.index({ userId: 1, pinId: 1, "collection.name": 1 }, { unique: true });
-// Prevent duplicates inside the same collection, but allow the same pin in multiple collections.
-Favorite.schema.index({ userId: 1, pinId: 1, collection: 1, name: 1 }, { unique: true });
+// Prevent duplicates inside the same collection, but allow the same pin in 
 
 // ====================== PLACEMENT MODEL ======================
 const placementSchema = new mongoose.Schema(
@@ -199,9 +198,6 @@ const placementSchema = new mongoose.Schema(
 
 // FIX: Register Placement model (was missing)
 const Placement = mongoose.model('Placement', placementSchema);
-
-// Create unique index for favorites
-Favorite.collection.createIndex({ userId: 1, pinId: 1 }, { unique: true });
 
 // ====================== MIDDLEWARE ======================
 function auth(req, res, next) {
