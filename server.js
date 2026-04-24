@@ -343,7 +343,7 @@ app.get("/api/pins", async (req, res) => {
   if (pins == null) {
     try {
       pins = await Pin.find({ available: true }).select(
-        "_id billboardId latitude longitude country addressShort description",
+        "_id billboardId latitude longitude country addressShort address description",
       );
       cache.set(cacheKey, pins);
       console.log("Pins cached");
