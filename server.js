@@ -97,15 +97,30 @@ const Campaign = mongoose.model(
   new mongoose.Schema(
     {
       userId: { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true },
+
       campaignName: { type: String, required: true },
+
       description: { type: String, required: true },
+
       organizationName: { type: String, required: true },
+
       category: { type: String, required: true },
+
       targetLocation: { type: String, enum: ["local", "worldwide", "both"], required: true },
+
       uploadedCreative: { type: String, default: null },
+
+      // NEW: UI field from both flows (store it)
+      targetAudience: { type: String, default: null },
+
+      // NEW: UI field from both flows (store it)
+      recommendationPriority: {
+        type: String,
+        enum: ["quality", "visibility", "balanced"],
+        default: "balanced",
+      },
+
       status: { type: String, enum: ["pending", "active", "completed"], default: "pending" },
-      createdAt: { type: Date, default: Date.now },
-      updatedAt: { type: Date, default: Date.now },
     },
     { timestamps: true },
   ),
