@@ -386,6 +386,23 @@ app.post("/api/pins", auth, requireRole("company"), async (req, res) => {
   }
 });
 
+app.get('/api/uploads/:id', auth, async (req, res) => {
+  try {
+    const upload = await Upload.findById(req.params.id);
+    if (!upload) {
+      return res.status(404).json({ error: 'Upload not found' });
+    }
+
+    if (upload.userId.toString() !== req.user.userId) {
+      return res.status(403).json({ error: 'Unauthorized' });
+    }
+
+    res.json({ success: true, upload });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.put("/api/pins/:id/approve", auth, requireRole("admin"), async (req, res) => {
   try {
     const pin = await Pin.findByIdAndUpdate(req.params.id, { available: true }, { new: true });
