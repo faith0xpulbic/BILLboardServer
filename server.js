@@ -1,3 +1,5 @@
+
+
 const express = require("express");
 const http = require("http");
 const socketIo = require("socket.io");
@@ -1124,227 +1126,26 @@ function checkAspectRatioTolerance(targetWidth, targetHeight, tolerancePct = 5) 
   };
 }
 
-// ── Pure PNG scaler ────────────────────────────────────────────────────────────
+//pngscale
 
-function decodePngToRgba(base64) {
-  const buffer = Buffer.from(base64, 'base64');
+const sharp = require('sharp');
 
-  for (let i = 0; i < PNG_SIGNATURE.length; i++) {
-    if (buffer[i] !== PNG_SIGNATURE[i]) throw new Error('Not a valid PNG');
-  }
+async function scaleToFitAspectRatio(srcBase64, targetWidth, targetHeight) {
+  const inputBuffer = Buffer.from(srcBase64, 'base64');
+  
+  const outputBuffer = await sharp(inputBuffer)
+    .resize(targetWidth, targetHeight, {
+      fit: 'cover',        // fills canvas, no letterbox
+      position: 'centre',
+      kernel: sharp.kernel.lanczos3  // better quality than bilinear
+    })
+    .png({
+      compressionLevel: 6,   // 0-9, 6 is good balance
+      effort: 7,             // zopfli-style effort (1-10)
+    })
+    .toBuffer();
 
-  let offset = 8;
-  let width, height, colorType;
-  const idatChunks = [];
-
-  while (offset < buffer.length) {
-    const length = buffer.readUInt32BE(offset);
-    const type = buffer.toString('ascii', offset + 4, offset + 8);
-    const data = buffer.slice(offset + 8, offset + 8 + length);
-
-    if (type === 'IHDR') {
-      width = data.readUInt32BE(0);
-      height = data.readUInt32BE(4);
-      colorType = data[9];
-    } else if (type === 'IDAT') {
-      idatChunks.push(data);
-    } else if (type === 'IEND') {
-      break;
-    }
-
-    offset += 12 + length;
-  }
-
-  if (!width || !height) throw new Error('Failed to parse PNG IHDR');
-
-  const { inflateSync } = require('node:zlib');
-  const raw = inflateSync(Buffer.concat(idatChunks));
-
-  let bytesPerPixel;
-  switch (colorType) {
-    case 0: bytesPerPixel = 1; break; // grayscale
-    case 2: bytesPerPixel = 3; break; // RGB
-    case 3: bytesPerPixel = 1; break; // indexed
-    case 4: bytesPerPixel = 2; break; // grayscale+alpha
-    case 6: bytesPerPixel = 4; break; // RGBA
-    default: throw new Error(`Unsupported PNG color type: ${colorType}`);
-  }
-
-  const pixels = new Uint8Array(width * height * 4);
-  const stride = width * bytesPerPixel;
-
-  function paeth(a, b, c) {
-    const p = a + b - c;
-    const pa = Math.abs(p - a);
-    const pb = Math.abs(p - b);
-    const pc = Math.abs(p - c);
-    return pa <= pb && pa <= pc ? a : pb <= pc ? b : c;
-  }
-
-  let rawOffset = 0;
-  const prevRow = new Uint8Array(stride);
-
-  for (let y = 0; y < height; y++) {
-    const filterType = raw[rawOffset++];
-    const row = new Uint8Array(raw.buffer, raw.byteOffset + rawOffset, stride);
-    rawOffset += stride;
-
-    const currRow = new Uint8Array(stride);
-
-    for (let x = 0; x < stride; x++) {
-      const left = x >= bytesPerPixel ? currRow[x - bytesPerPixel] : 0;
-      const up = prevRow[x];
-      const upLeft = x >= bytesPerPixel ? prevRow[x - bytesPerPixel] : 0;
-
-      switch (filterType) {
-        case 0: currRow[x] = row[x]; break;
-        case 1: currRow[x] = (row[x] + left) & 0xff; break;
-        case 2: currRow[x] = (row[x] + up) & 0xff; break;
-        case 3: currRow[x] = (row[x] + ((left + up) >> 1)) & 0xff; break;
-        case 4: currRow[x] = (row[x] + paeth(left, up, upLeft)) & 0xff; break;
-        default: throw new Error(`Unknown PNG filter: ${filterType}`);
-      }
-    }
-
-    prevRow.set(currRow);
-
-    for (let x = 0; x < width; x++) {
-      const pxOffset = (y * width + x) * 4;
-      const srcOffset = x * bytesPerPixel;
-
-      switch (colorType) {
-        case 0:
-          pixels[pxOffset] = currRow[srcOffset];
-          pixels[pxOffset + 1] = currRow[srcOffset];
-          pixels[pxOffset + 2] = currRow[srcOffset];
-          pixels[pxOffset + 3] = 255;
-          break;
-        case 2:
-          pixels[pxOffset] = currRow[srcOffset];
-          pixels[pxOffset + 1] = currRow[srcOffset + 1];
-          pixels[pxOffset + 2] = currRow[srcOffset + 2];
-          pixels[pxOffset + 3] = 255;
-          break;
-        case 4:
-          pixels[pxOffset] = currRow[srcOffset];
-          pixels[pxOffset + 1] = currRow[srcOffset];
-          pixels[pxOffset + 2] = currRow[srcOffset];
-          pixels[pxOffset + 3] = currRow[srcOffset + 1];
-          break;
-        case 6:
-          pixels[pxOffset] = currRow[srcOffset];
-          pixels[pxOffset + 1] = currRow[srcOffset + 1];
-          pixels[pxOffset + 2] = currRow[srcOffset + 2];
-          pixels[pxOffset + 3] = currRow[srcOffset + 3];
-          break;
-      }
-    }
-  }
-
-  return { width, height, pixels };
-}
-
-function encodeRgbaToPng(pixels, width, height) {
-  const { deflateSync } = require('node:zlib');
-  const stride = width * 4;
-  const rawSize = height * (1 + stride);
-  const raw = Buffer.alloc(rawSize);
-
-  for (let y = 0; y < height; y++) {
-    const rowStart = y * (1 + stride);
-    raw[rowStart] = 0; // filter type: None
-    for (let x = 0; x < stride; x++) {
-      raw[rowStart + 1 + x] = pixels[y * stride + x];
-    }
-  }
-
-  const ihdr = Buffer.alloc(13);
-  ihdr.writeUInt32BE(width, 0);
-  ihdr.writeUInt32BE(height, 4);
-  ihdr[8] = 8;  // bit depth
-  ihdr[9] = 6;  // color type: RGBA
-  ihdr[10] = 0;
-  ihdr[11] = 0;
-  ihdr[12] = 0;
-
-  const png = Buffer.concat([
-    PNG_SIGNATURE,
-    createPngChunk('IHDR', ihdr),
-    createPngChunk('IDAT', deflateSync(raw)),
-    createPngChunk('IEND', Buffer.alloc(0)),
-  ]);
-
-  return png.toString('base64');
-}
-
-function sampleBilinear(pixels, srcWidth, srcHeight, sx, sy) {
-  const x0 = Math.floor(sx);
-  const y0 = Math.floor(sy);
-  const x1 = Math.min(x0 + 1, srcWidth - 1);
-  const y1 = Math.min(y0 + 1, srcHeight - 1);
-  const fx = sx - x0;
-  const fy = sy - y0;
-
-  const result = new Uint8Array(4);
-  for (let c = 0; c < 4; c++) {
-    const tl = pixels[(y0 * srcWidth + x0) * 4 + c];
-    const tr = pixels[(y0 * srcWidth + x1) * 4 + c];
-    const bl = pixels[(y1 * srcWidth + x0) * 4 + c];
-    const br = pixels[(y1 * srcWidth + x1) * 4 + c];
-    result[c] = Math.round(
-      tl * (1 - fx) * (1 - fy) +
-      tr * fx * (1 - fy) +
-      bl * (1 - fx) * fy +
-      br * fx * fy
-    );
-  }
-  return result;
-}
-
-/**
- * Cover-scales srcBase64 PNG to fill targetWidth x targetHeight exactly.
- * Composited onto a black canvas. Bilinear interpolation.
- * Input/output: base64 PNG strings.
- */
-function pngScaleToFit(srcBase64, targetWidth, targetHeight) {
-  const src = decodePngToRgba(srcBase64);
-
-  const scaleX = targetWidth / src.width;
-  const scaleY = targetHeight / src.height;
-  const scale = Math.max(scaleX, scaleY); // cover — no black bars
-
-  const scaledW = Math.round(src.width * scale);
-  const scaledH = Math.round(src.height * scale);
-
-  const offsetX = Math.round((targetWidth - scaledW) / 2);
-  const offsetY = Math.round((targetHeight - scaledH) / 2);
-
-  // Black opaque canvas
-  const output = new Uint8Array(targetWidth * targetHeight * 4);
-  for (let i = 0; i < output.length; i += 4) {
-    output[i] = 0;
-    output[i + 1] = 0;
-    output[i + 2] = 0;
-    output[i + 3] = 255;
-  }
-
-  for (let y = 0; y < targetHeight; y++) {
-    for (let x = 0; x < targetWidth; x++) {
-      const sx = (x - offsetX) / scale;
-      const sy = (y - offsetY) / scale;
-
-      if (sx < 0 || sy < 0 || sx >= src.width || sy >= src.height) continue;
-
-      const sample = sampleBilinear(src.pixels, src.width, src.height, sx, sy);
-      const outIdx = (y * targetWidth + x) * 4;
-      output[outIdx]     = sample[0];
-      output[outIdx + 1] = sample[1];
-      output[outIdx + 2] = sample[2];
-      output[outIdx + 3] = sample[3];
-    }
-  }
-
-  return encodeRgbaToPng(output, targetWidth, targetHeight);
+  return outputBuffer.toString('base64');
 }
 
 // ── Cloudinary upload helper ───────────────────────────────────────────────────
@@ -1495,7 +1296,7 @@ The last image is a blank black reference canvas sized ${referenceCanvas.width}x
     console.log(`🖼  Running PNG refix (reason: ${reason})...`);
 
     if (generatedMime.includes('png')) {
-      finalBase64 = pngScaleToFit(generatedBase64, targetWidth, targetHeight);
+      finalBase64 = await scaleToFitAspectRatio(generatedBase64, targetWidth, targetHeight);
       console.log('✅ PNG refix complete');
     } else {
       console.warn('⚠️  Non-PNG output from Gemini — skipping refix');
