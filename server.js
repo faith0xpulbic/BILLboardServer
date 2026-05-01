@@ -774,7 +774,7 @@ app.get('/api/placements/:id', async (req, res) => {
   try {
     const placement = await Placement.findById(req.params.id)
       .populate('campaignId', 'campaignName description organizationName category')
-      .populate('uploadId', 'cloudinaryUrl dimensions format resourceType sizeBytes length');
+      .populate('uploadId', 'cloudinaryUrl dimensions format resourceType sizeBytes length refits');
 
     if (!placement) return res.status(404).json({ error: 'Placement not found' });
 
