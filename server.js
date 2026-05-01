@@ -751,7 +751,7 @@ app.get('/api/placements', optionalAuth, async (req, res) => {
 
     const placements = await Placement.find(query)
       .populate('campaignId', 'campaignName description organizationName category')
-      .populate('uploadId', 'cloudinaryUrl dimensions format resourceType sizeBytes length')
+      .populate('uploadId', 'cloudinaryUrl dimensions format resourceType sizeBytes length refits')
       .sort({ createdAt: -1 });
 
     const result = placements.map(p => ({
