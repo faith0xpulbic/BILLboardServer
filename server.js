@@ -354,6 +354,20 @@ app.post("/api/auth/login", async (req, res) => {
   }
 });
 
+app.get("/api/auth/me", auth, async (req, res) => {
+  try {
+    const user = await User.findById(req.user.userId).select(
+      "email role organizationName businessAbout verified createdAt",
+    );
+
+    if (!user) return res.status(404).json({ error: "User not found" });
+
+    res.json({ success: true, user });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ====================== PIN ROUTES ======================
 
 app.get("/api/pins", async (req, res) => {
