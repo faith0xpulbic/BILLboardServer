@@ -89,6 +89,7 @@ const User = mongoose.model(
     passwordHash: { type: String, required: true },
     role: { type: String, enum: ["user", "company", "reviewer", "admin"], default: "user" },
     organizationName: { type: String, required: true },
+    businessAbout: { type: String, default: null },
     verified: { type: Boolean, default: true },
     createdAt: { type: Date, default: Date.now },
   }),
@@ -260,8 +261,9 @@ const optionalAuth = (req, res, next) => {
 
 // ====================== AUTH ROUTES ======================
 
+// POST /api/auth/register
 app.post("/api/auth/register", async (req, res) => {
-  const { email, password, role, companyName } = req.body;
+  const { email, password, role, companyName, businessAbout } = req.body;
 
   if (!email || !password) {
     return res.status(400).json({ error: "Email and password required" });
@@ -284,20 +286,19 @@ app.post("/api/auth/register", async (req, res) => {
       passwordHash: hashed,
       role: role || "user",
       organizationName,
+      businessAbout: businessAbout ?? null,
       verified: true,
     });
 
     await user.save();
 
-    console.log("✓ User created:", user._id, "| Organization:", organizationName);
-
     res.status(201).json({
       message: "User created",
       userId: user._id,
       organizationName: user.organizationName,
+      businessAbout: user.businessAbout,
     });
   } catch (err) {
-    console.error("Registration error:", err);
     res.status(500).json({ error: err.message });
   }
 });
@@ -329,6 +330,7 @@ app.post("/api/auth/login", async (req, res) => {
       refreshToken,
       role: user.role,
       organizationName: user.organizationName,
+      businessAbout: user.businessAbout,
       message: "Login successful",
     });
   } catch (err) {
