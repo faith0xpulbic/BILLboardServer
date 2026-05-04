@@ -292,9 +292,24 @@ app.post("/api/auth/register", async (req, res) => {
 
     await user.save();
 
+    const accessToken = jwt.sign(
+      { userId: user._id, role: user.role, organizationName: user.organizationName },
+      process.env.JWT_SECRET,
+      { expiresIn: "1h" },
+    );
+
+    const refreshToken = jwt.sign(
+      { userId: user._id },
+      process.env.JWT_REFRESH_SECRET || process.env.JWT_SECRET,
+      { expiresIn: "7d" },
+    );
+
     res.status(201).json({
       message: "User created",
       userId: user._id,
+      accessToken,
+      refreshToken,
+      role: user.role,
       organizationName: user.organizationName,
       businessAbout: user.businessAbout,
     });
@@ -302,6 +317,7 @@ app.post("/api/auth/register", async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
+
 
 app.post("/api/auth/login", async (req, res) => {
   const { email, password } = req.body;
