@@ -671,6 +671,8 @@ app.get("/api/campaigns", optionalAuth, async (req, res) => {
   }
 });
 
+
+
 app.get("/api/campaigns/:id", optionalAuth, async (req, res) => {
   try {
     let query = { _id: req.params.id };
@@ -691,6 +693,64 @@ app.get("/api/campaigns/:id", optionalAuth, async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
+
+app.patch("/api/campaigns/:id", auth, async (req, res) => {
+  try {
+    const { campaignName, uploadedCreative } = req.body;
+    const campaign = await Campaign.findOne({ _id: req.params.id, userId: req.user.userId });
+    if (!campaign) return res.status(404).json({ error: "Campaign not found" });
+    if (campaignName !== undefined) campaign.campaignName = campaignName;
+    if (uploadedCreative !== undefined) campaign.uploadedCreative = uploadedCreative;
+    await campaign.save();
+    console.log(`✓ Campaign ${campaign._id} updated`);
+    res.json({ success: true, campaign });
+  } catch (err) {
+    console.error("Update campaign error:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.delete("/api/campaigns/:id", auth, async (req, res) => {
+  try {
+    const campaign = await Campaign.findOne({ _id: req.params.id, userId: req.user.userId });
+    if (!campaign) return res.status(404).json({ error: "Campaign not found" });
+    const uploads = await Upload.find({ campaignId: req.params.id, userId: req.user.userId });
+    for (const u of uploads) {
+      try { await cloudinary.uploader.destroy(u.publicId); } catch (e) {}
+      if (u.refits) { for (const [, refit] of u.refits) { try { if (refit.publicId) await cloudinary.uploader.destroy(refit.publicId); } catch (e) {} } }
+    }
+    await Upload.deleteMany({ campaignId: req.params.id, userId: req.user.userId });
+    await Placement.deleteMany({ campaignId: req.params.id, userId: req.user.userId });
+    await Campaign.deleteOne({ _id: req.params.id, userId: req.user.userId });
+    console.log(`✓ Campaign ${req.params.id} deleted with ${uploads.length} uploads`);
+    res.json({ success: true, message: "Campaign and all related data deleted" });
+  } catch (err) {
+    console.error("Delete campaign error:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.delete("/api/uploads/:id", auth, async (req, res) => {
+  try {
+    const uploadDoc = await Upload.findOne({ _id: req.params.id, userId: req.user.userId });
+    if (!uploadDoc) return res.status(404).json({ error: "Upload not found" });
+    try { await cloudinary.uploader.destroy(uploadDoc.publicId); } catch (e) {}
+    if (uploadDoc.refits) { for (const [, refit] of uploadDoc.refits) { try { if (refit.publicId) await cloudinary.uploader.destroy(refit.publicId); } catch (e) {} } }
+    const campaign = await Campaign.findOne({ _id: uploadDoc.campaignId, userId: req.user.userId });
+    if (campaign && campaign.uploadedCreative === uploadDoc.cloudinaryUrl) {
+      const nextUpload = await Upload.findOne({ campaignId: uploadDoc.campaignId, userId: req.user.userId, _id: { $ne: req.params.id } }).sort({ createdAt: -1 });
+      campaign.uploadedCreative = nextUpload ? nextUpload.cloudinaryUrl : null;
+      await campaign.save();
+    }
+    await Upload.deleteOne({ _id: req.params.id, userId: req.user.userId });
+    console.log(`✓ Upload ${req.params.id} deleted`);
+    res.json({ success: true, message: "Upload deleted" });
+  } catch (err) {
+    console.error("Delete upload error:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 
 // ====================== PLACEMENT ROUTES ======================
 
