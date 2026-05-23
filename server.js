@@ -222,7 +222,7 @@ const waitlistSchema = new mongoose.Schema({
   createdAt: { type: Date, default: Date.now }
 });
 
-module.exports = mongoose.model('Waitlist', waitlistSchema);
+const Waitlist = mongoose.model('Waitlist', waitlistSchema);
 
 // FIX: Register Placement model (was missing)
 const Placement = mongoose.model('Placement', placementSchema);
@@ -376,8 +376,6 @@ app.get("/api/auth/me", auth, async (req, res) => {
 });
 
 //____WAITLIST_
-
-const Waitlist = require('./models/Waitlist');
 
 app.post('/api/waitlist', async (req, res) => {
   try {
