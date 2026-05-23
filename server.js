@@ -217,6 +217,13 @@ const placementSchema = new mongoose.Schema(
   { timestamps: true }
 );
 
+const waitlistSchema = new mongoose.Schema({
+  email: { type: String, required: true, unique: true, lowercase: true, trim: true },
+  createdAt: { type: Date, default: Date.now }
+});
+
+module.exports = mongoose.model('Waitlist', waitlistSchema);
+
 // FIX: Register Placement model (was missing)
 const Placement = mongoose.model('Placement', placementSchema);
 
@@ -364,6 +371,27 @@ app.get("/api/auth/me", auth, async (req, res) => {
 
     res.json({ success: true, user });
   } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+//____WAITLIST_
+
+const Waitlist = require('./models/Waitlist');
+
+app.post('/api/waitlist', async (req, res) => {
+  try {
+    const { email } = req.body;
+    if (!email) return res.status(400).json({ error: 'Email required' });
+
+    const entry = new Waitlist({ email });
+    await entry.save();
+
+    res.status(201).json({ success: true });
+  } catch (err) {
+    if (err.code === 11000) {
+      return res.status(409).json({ error: 'Already subscribed' });
+    }
     res.status(500).json({ error: err.message });
   }
 });
