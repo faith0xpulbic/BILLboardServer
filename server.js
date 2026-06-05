@@ -1,5 +1,3 @@
-
-
 const express = require("express");
 const http = require("http");
 const socketIo = require("socket.io");
@@ -217,13 +215,6 @@ const placementSchema = new mongoose.Schema(
   { timestamps: true }
 );
 
-const waitlistSchema = new mongoose.Schema({
-  email: { type: String, required: true, unique: true, lowercase: true, trim: true },
-  createdAt: { type: Date, default: Date.now }
-});
-
-const Waitlist = mongoose.model('Waitlist', waitlistSchema);
-
 // FIX: Register Placement model (was missing)
 const Placement = mongoose.model('Placement', placementSchema);
 
@@ -371,25 +362,6 @@ app.get("/api/auth/me", auth, async (req, res) => {
 
     res.json({ success: true, user });
   } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-//____WAITLIST_
-
-app.post('/api/waitlist', async (req, res) => {
-  try {
-    const { email } = req.body;
-    if (!email) return res.status(400).json({ error: 'Email required' });
-
-    const entry = new Waitlist({ email });
-    await entry.save();
-
-    res.status(201).json({ success: true });
-  } catch (err) {
-    if (err.code === 11000) {
-      return res.status(409).json({ error: 'Already subscribed' });
-    }
     res.status(500).json({ error: err.message });
   }
 });
@@ -1463,14 +1435,14 @@ async function scaleToFitAspectRatio(srcBase64, targetWidth, targetHeight) {
 
   const outputBuffer = await sharp(inputBuffer)
     .resize(targetWidth, targetHeight, {
-      fit: 'cover',        // fills canvas, crops edges to maintain aspect ratio
-      // fit: 'fill',      // ← UNCOMMENT THIS INSTEAD IF YOU WANT TO SQUEEZE/STRETCH
+      //fit: 'cover',        /fills canvas, crops edges to maintain aspect ratio
+      fit: 'fill',      // ← UNCOMMENT THIS INSTEAD IF YOU WANT TO SQUEEZE/STRETCH
       position: 'centre',
       kernel: sharp.kernel.lanczos3
     })
     .png({
-      compressionLevel: 6,
-      effort: 7,
+      compressionLevel: 3,
+      effort: 3,
     })
     .toBuffer();
 
