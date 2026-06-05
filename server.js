@@ -302,7 +302,7 @@ app.post("/api/auth/register", async (req, res) => {
     const accessToken = jwt.sign(
       { userId: user._id, role: user.role, organizationName: user.organizationName },
       process.env.JWT_SECRET,
-      { expiresIn: "1h" },
+      { expiresIn: "5d" },
     );
 
     const refreshToken = jwt.sign(
