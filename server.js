@@ -1,5 +1,3 @@
-
-
 const express = require("express");
 const http = require("http");
 const socketIo = require("socket.io");
@@ -69,18 +67,12 @@ const Pin = mongoose.model(
     description: String,
     available: { type: Boolean, default: false },
     referenceId: String,
-    gisData: {
-      type: {
-        population: Number,
-        environment: String,
-        location: String,
-        attributes: { type: [String], default: undefined },
-        rwi: Number,
-      },
-      default: undefined,
-    },
-  }, { strict: false })  // <-- add this
+    dashboardId: { type: String, default: null, index: true },
+    gisData: { /* unchanged */ },
+  }, { strict: false })
 );
+
+const { randomUUID } = require("crypto");
 
 const User = mongoose.model(
   "User",
@@ -91,6 +83,12 @@ const User = mongoose.model(
     organizationName: { type: String, required: true },
     businessAbout: { type: String, default: null },
     verified: { type: Boolean, default: true },
+    dashboardId: {
+      type: String,
+      required: true,
+      default: () => randomUUID(),
+      immutable: true,
+    },
     createdAt: { type: Date, default: Date.now },
   }),
 );
@@ -100,30 +98,15 @@ const Campaign = mongoose.model(
   new mongoose.Schema(
     {
       userId: { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true },
-
       campaignName: { type: String, required: true },
-
       description: { type: String, required: true },
-
       organizationName: { type: String, required: true },
-
       category: { type: String, required: true },
-
       targetLocation: { type: String, enum: ["local", "worldwide", "both"], required: true },
-
       uploadedCreative: { type: String, default: null },
-
-      // NEW: UI field from both flows (store it)
-      targetAudience: { type: String, default: null },
-
-      // NEW: UI field from both flows (store it)
-      recommendationPriority: {
-        type: String,
-        enum: ["quality", "visibility", "balanced"],
-        default: "balanced",
-      },
-
       status: { type: String, enum: ["pending", "active", "completed"], default: "pending" },
+      createdAt: { type: Date, default: Date.now },
+      updatedAt: { type: Date, default: Date.now },
     },
     { timestamps: true },
   ),
@@ -152,12 +135,12 @@ const Upload = mongoose.model(
       declineReason: String,
       refits: {
         type: Map,
-        of: {
-          cloudinaryUrl: String,
-          publicId: String,
+        of: new mongoose.Schema({
+          cloudinaryUrl: { type: String, required: true },
+          publicId: { type: String, required: true },
           dimensions: { width: Number, height: Number },
-          createdAt: Date
-        },
+          createdAt: { type: Date, default: Date.now }
+        }, { _id: false }),
         default: new Map()
       }
     },
@@ -171,20 +154,15 @@ const Favorite = mongoose.model(
     {
       userId: { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true },
       pinId: { type: String, required: true },
-      collection: {
-        name: { type: String, required: true, default: "Favorites" },
-      },
       billboardId: String,
       latitude: Number,
       longitude: Number,
       address: String,
+      createdAt: { type: Date, default: Date.now },
     },
     { timestamps: true },
   ),
 );
-
-Favorite.schema.index({ userId: 1, pinId: 1, "collection.name": 1 }, { unique: true });
-// Prevent duplicates inside the same collection, but allow the same pin in 
 
 // ====================== PLACEMENT MODEL ======================
 const placementSchema = new mongoose.Schema(
@@ -217,15 +195,11 @@ const placementSchema = new mongoose.Schema(
   { timestamps: true }
 );
 
-const waitlistSchema = new mongoose.Schema({
-  email: { type: String, required: true, unique: true, lowercase: true, trim: true },
-  createdAt: { type: Date, default: Date.now }
-});
-
-const Waitlist = mongoose.model('Waitlist', waitlistSchema);
-
 // FIX: Register Placement model (was missing)
 const Placement = mongoose.model('Placement', placementSchema);
+
+// Create unique index for favorites
+Favorite.collection.createIndex({ userId: 1, pinId: 1 }, { unique: true });
 
 // ====================== MIDDLEWARE ======================
 function auth(req, res, next) {
@@ -268,9 +242,8 @@ const optionalAuth = (req, res, next) => {
 
 // ====================== AUTH ROUTES ======================
 
-// POST /api/auth/register
 app.post("/api/auth/register", async (req, res) => {
-  const { email, password, role, companyName, businessAbout } = req.body;
+  const { email, password, role, companyName } = req.body;
 
   if (!email || !password) {
     return res.status(400).json({ error: "Email and password required" });
@@ -293,38 +266,23 @@ app.post("/api/auth/register", async (req, res) => {
       passwordHash: hashed,
       role: role || "user",
       organizationName,
-      businessAbout: businessAbout ?? null,
       verified: true,
     });
 
     await user.save();
 
-    const accessToken = jwt.sign(
-      { userId: user._id, role: user.role, organizationName: user.organizationName },
-      process.env.JWT_SECRET,
-      { expiresIn: "5d" },
-    );
-
-    const refreshToken = jwt.sign(
-      { userId: user._id },
-      process.env.JWT_REFRESH_SECRET || process.env.JWT_SECRET,
-      { expiresIn: "7d" },
-    );
+    console.log("✓ User created:", user._id, "| Organization:", organizationName);
 
     res.status(201).json({
       message: "User created",
       userId: user._id,
-      accessToken,
-      refreshToken,
-      role: user.role,
       organizationName: user.organizationName,
-      businessAbout: user.businessAbout,
     });
   } catch (err) {
+    console.error("Registration error:", err);
     res.status(500).json({ error: err.message });
   }
 });
-
 
 app.post("/api/auth/login", async (req, res) => {
   const { email, password } = req.body;
@@ -336,11 +294,12 @@ app.post("/api/auth/login", async (req, res) => {
     const match = await bcrypt.compare(password, user.passwordHash);
     if (!match) return res.status(401).json({ error: "Invalid credentials" });
 
-    const accessToken = jwt.sign(
-      { userId: user._id, role: user.role, organizationName: user.organizationName },
-      process.env.JWT_SECRET,
-      { expiresIn: "1h" },
-    );
+    // register
+const accessToken = jwt.sign(
+  { userId: user._id, role: user.role, organizationName: user.organizationName, dashboardId: user.dashboardId },
+  process.env.JWT_SECRET,
+  { expiresIn: "5d" },
+);
 
     const refreshToken = jwt.sign(
       { userId: user._id },
@@ -353,43 +312,9 @@ app.post("/api/auth/login", async (req, res) => {
       refreshToken,
       role: user.role,
       organizationName: user.organizationName,
-      businessAbout: user.businessAbout,
       message: "Login successful",
     });
   } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-app.get("/api/auth/me", auth, async (req, res) => {
-  try {
-    const user = await User.findById(req.user.userId).select(
-      "email role organizationName businessAbout verified createdAt",
-    );
-
-    if (!user) return res.status(404).json({ error: "User not found" });
-
-    res.json({ success: true, user });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-//____WAITLIST_
-
-app.post('/api/waitlist', async (req, res) => {
-  try {
-    const { email } = req.body;
-    if (!email) return res.status(400).json({ error: 'Email required' });
-
-    const entry = new Waitlist({ email });
-    await entry.save();
-
-    res.status(201).json({ success: true });
-  } catch (err) {
-    if (err.code === 11000) {
-      return res.status(409).json({ error: 'Already subscribed' });
-    }
     res.status(500).json({ error: err.message });
   }
 });
@@ -403,7 +328,7 @@ app.get("/api/pins", async (req, res) => {
   if (pins == null) {
     try {
       pins = await Pin.find({ available: true }).select(
-        "_id billboardId latitude longitude country addressShort address description mainImageUrl horizontalImageUrl",
+        "_id billboardId latitude longitude country addressShort description",
       );
       cache.set(cacheKey, pins);
       console.log("Pins cached");
@@ -441,23 +366,6 @@ app.post("/api/pins", auth, requireRole("company"), async (req, res) => {
     cache.del("all_available_pins");
     cache.del(`pin_${newPin._id}`);
     res.status(201).json(newPin);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-app.get('/api/uploads/:id', auth, async (req, res) => {
-  try {
-    const upload = await Upload.findById(req.params.id);
-    if (!upload) {
-      return res.status(404).json({ error: 'Upload not found' });
-    }
-
-    if (upload.userId.toString() !== req.user.userId) {
-      return res.status(403).json({ error: 'Unauthorized' });
-    }
-
-    res.json({ success: true, upload });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -620,10 +528,25 @@ app.put("/api/uploads/:id", auth, upload.single("file"), async (req, res) => {
   }
 });
 
-app.get('/api/uploads', async (req, res) => {
+// after
+app.get('/api/uploads', auth, async (req, res) => {
   try {
     const { campaignId, status } = req.query;
     let query = {};
+
+    if (req.user.role === 'admin') {
+      // unscoped — full visibility, same as placements
+    } else if (req.user.role === 'reviewer') {
+      const scopedPins = await Pin.find({ dashboardId: req.user.dashboardId }).select('_id');
+      const scopedPinIds = scopedPins.map(p => p._id.toString());
+      const scopedPlacements = await Placement.find({ pinId: { $in: scopedPinIds } }).select('uploadId');
+      const scopedUploadIds = scopedPlacements.map(pl => pl.uploadId);
+      query._id = { $in: scopedUploadIds };
+      console.log(`Reviewer ${req.user.userId} (dashboardId=${req.user.dashboardId}) → scoped to ${scopedUploadIds.length} uploads`);
+    } else {
+      query.userId = req.user.userId;
+    }
+
     if (campaignId) query.campaignId = campaignId;
     if (status) query.status = status;
 
@@ -697,8 +620,6 @@ app.get("/api/campaigns", optionalAuth, async (req, res) => {
   }
 });
 
-
-
 app.get("/api/campaigns/:id", optionalAuth, async (req, res) => {
   try {
     let query = { _id: req.params.id };
@@ -719,64 +640,6 @@ app.get("/api/campaigns/:id", optionalAuth, async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
-
-app.patch("/api/campaigns/:id", auth, async (req, res) => {
-  try {
-    const { campaignName, uploadedCreative } = req.body;
-    const campaign = await Campaign.findOne({ _id: req.params.id, userId: req.user.userId });
-    if (!campaign) return res.status(404).json({ error: "Campaign not found" });
-    if (campaignName !== undefined) campaign.campaignName = campaignName;
-    if (uploadedCreative !== undefined) campaign.uploadedCreative = uploadedCreative;
-    await campaign.save();
-    console.log(`✓ Campaign ${campaign._id} updated`);
-    res.json({ success: true, campaign });
-  } catch (err) {
-    console.error("Update campaign error:", err);
-    res.status(500).json({ error: err.message });
-  }
-});
-
-app.delete("/api/campaigns/:id", auth, async (req, res) => {
-  try {
-    const campaign = await Campaign.findOne({ _id: req.params.id, userId: req.user.userId });
-    if (!campaign) return res.status(404).json({ error: "Campaign not found" });
-    const uploads = await Upload.find({ campaignId: req.params.id, userId: req.user.userId });
-    for (const u of uploads) {
-      try { await cloudinary.uploader.destroy(u.publicId); } catch (e) {}
-      if (u.refits) { for (const [, refit] of u.refits) { try { if (refit.publicId) await cloudinary.uploader.destroy(refit.publicId); } catch (e) {} } }
-    }
-    await Upload.deleteMany({ campaignId: req.params.id, userId: req.user.userId });
-    await Placement.deleteMany({ campaignId: req.params.id, userId: req.user.userId });
-    await Campaign.deleteOne({ _id: req.params.id, userId: req.user.userId });
-    console.log(`✓ Campaign ${req.params.id} deleted with ${uploads.length} uploads`);
-    res.json({ success: true, message: "Campaign and all related data deleted" });
-  } catch (err) {
-    console.error("Delete campaign error:", err);
-    res.status(500).json({ error: err.message });
-  }
-});
-
-app.delete("/api/uploads/:id", auth, async (req, res) => {
-  try {
-    const uploadDoc = await Upload.findOne({ _id: req.params.id, userId: req.user.userId });
-    if (!uploadDoc) return res.status(404).json({ error: "Upload not found" });
-    try { await cloudinary.uploader.destroy(uploadDoc.publicId); } catch (e) {}
-    if (uploadDoc.refits) { for (const [, refit] of uploadDoc.refits) { try { if (refit.publicId) await cloudinary.uploader.destroy(refit.publicId); } catch (e) {} } }
-    const campaign = await Campaign.findOne({ _id: uploadDoc.campaignId, userId: req.user.userId });
-    if (campaign && campaign.uploadedCreative === uploadDoc.cloudinaryUrl) {
-      const nextUpload = await Upload.findOne({ campaignId: uploadDoc.campaignId, userId: req.user.userId, _id: { $ne: req.params.id } }).sort({ createdAt: -1 });
-      campaign.uploadedCreative = nextUpload ? nextUpload.cloudinaryUrl : null;
-      await campaign.save();
-    }
-    await Upload.deleteOne({ _id: req.params.id, userId: req.user.userId });
-    console.log(`✓ Upload ${req.params.id} deleted`);
-    res.json({ success: true, message: "Upload deleted" });
-  } catch (err) {
-    console.error("Delete upload error:", err);
-    res.status(500).json({ error: err.message });
-  }
-});
-
 
 // ====================== PLACEMENT ROUTES ======================
 
@@ -844,7 +707,6 @@ app.get('/api/placements', optionalAuth, async (req, res) => {
       { status: 'approved', endDate: { $lt: new Date() } },
       { $set: { status: 'completed', updatedAt: new Date() } }
     );
-
     if (expiredCount.modifiedCount > 0) {
       console.log(`✅ Auto-expired ${expiredCount.modifiedCount} placements`);
     }
@@ -853,20 +715,38 @@ app.get('/api/placements', optionalAuth, async (req, res) => {
     let query = {};
 
     if (req.user) {
-      if (req.user.role === 'reviewer' || req.user.role === 'admin') {
-        console.log(`Reviewer/Admin requested ALL placements`);
+      if (req.user.role === 'admin') {
+        console.log(`Admin ${req.user.userId} requested ALL placements`);
+        // admin stays unscoped — full visibility for support/ops
+      } else if (req.user.role === 'reviewer') {
+        // NEW — reviewer only sees placements on pins tagged with their own dashboardId
+        const scopedPins = await Pin.find({ dashboardId: req.user.dashboardId }).select('_id');
+        const scopedPinIds = scopedPins.map(p => p._id.toString());
+        query.pinId = { $in: scopedPinIds };
+        console.log(`Reviewer ${req.user.userId} (dashboardId=${req.user.dashboardId}) → scoped to ${scopedPinIds.length} pins`);
       } else {
         query.userId = req.user.userId;
         console.log(`Regular user ${req.user.userId} → only own placements`);
       }
     } else {
-      console.log("No token → Reviewer Dashboard mode: returning ALL placements");
+      // NEW — no more "no token = return everything." That was the reviewer-dashboard
+      // bypass hiding in optionalAuth. Unauthenticated callers now get nothing.
+      console.log("No token → returning empty placements list");
+      return res.json({ success: true, placements: [] });
     }
 
     if (status) query.status = status;
     if (campaignId) query.campaignId = campaignId;
-    if (pinId) query.pinId = pinId;
-
+    if (pinId) {
+  if (query.pinId && query.pinId.$in) {
+    if (!query.pinId.$in.includes(pinId)) {
+      return res.json({ success: true, placements: [] }); // outside this reviewer's scope
+    }
+    query.pinId = pinId; // narrow to the one pin, still within scope
+  } else {
+    query.pinId = pinId;
+  }
+    }
     const placements = await Placement.find(query)
       .populate('campaignId', 'campaignName description organizationName category')
       .populate('uploadId', 'cloudinaryUrl dimensions format resourceType sizeBytes length refits')
@@ -888,11 +768,11 @@ app.get('/api/placements', optionalAuth, async (req, res) => {
   }
 });
 
-app.get('/api/placements/:id', async (req, res) => {
+app.get('/api/placements/:id', auth, async (req, res) => {
   try {
     const placement = await Placement.findById(req.params.id)
       .populate('campaignId', 'campaignName description organizationName category')
-      .populate('uploadId', 'cloudinaryUrl dimensions format resourceType sizeBytes length refits');
+      .populate('uploadId', 'cloudinaryUrl dimensions format resourceType sizeBytes length');
 
     if (!placement) return res.status(404).json({ error: 'Placement not found' });
 
@@ -910,7 +790,7 @@ app.get('/api/placements/:id', async (req, res) => {
   }
 });
 
-app.put("/api/placements/:id/approve", async (req, res) => {
+app.put("/api/placements/:id/approve", auth, async (req, res) => {
   try {
     const placement = await Placement.findById(req.params.id);
     if (!placement) return res.status(404).json({ error: "Placement not found" });
@@ -936,7 +816,7 @@ app.put("/api/placements/:id/approve", async (req, res) => {
   }
 });
 
-app.put("/api/placements/:id/decline", async (req, res) => {
+app.put("/api/placements/:id/decline", auth, async (req, res) => {
   try {
     const { reason } = req.body;
     if (!reason) return res.status(400).json({ error: "Decline reason is required" });
@@ -966,7 +846,8 @@ app.put("/api/placements/:id/decline", async (req, res) => {
 app.post("/api/favorites", auth, async (req, res) => {
   try {
     const { pinId, billboardId, latitude, longitude, address } = req.body;
-    const collectionName = req.body?.collection?.name || req.body?.name || "Favorites";
+
+    console.log("📥 Received favorite request:", { pinId, billboardId });
 
     if (!pinId) {
       return res.status(400).json({ error: "pinId is required" });
@@ -975,13 +856,13 @@ app.post("/api/favorites", auth, async (req, res) => {
     const existing = await Favorite.findOne({
       userId: req.user.userId,
       pinId,
-      "collection.name": collectionName,
     });
 
     if (existing) {
+      console.log("⚠ Already favorited:", pinId);
       return res.status(200).json({
         success: true,
-        message: "Already saved",
+        message: "Already favorited",
         favorite: existing,
       });
     }
@@ -989,7 +870,6 @@ app.post("/api/favorites", auth, async (req, res) => {
     const favorite = new Favorite({
       userId: req.user.userId,
       pinId,
-      collection: { name: collectionName },
       billboardId,
       latitude,
       longitude,
@@ -997,45 +877,48 @@ app.post("/api/favorites", auth, async (req, res) => {
     });
 
     await favorite.save();
+
+    console.log("✓ Favorite saved:", favorite._id);
+
     res.status(201).json({ success: true, favorite });
   } catch (err) {
+    console.error("Favorite error:", err);
     if (err.code === 11000) {
-      return res.status(400).json({ error: "Already saved in this collection" });
+      return res.status(400).json({ error: "Already favorited" });
     }
     res.status(500).json({ error: err.message });
   }
 });
 
-
 app.delete("/api/favorites/:pinId", auth, async (req, res) => {
   try {
-    const collectionName = req.query.name || "Favorites";
+    console.log("📥 Delete favorite request:", req.params.pinId);
 
     const result = await Favorite.findOneAndDelete({
       userId: req.user.userId,
       pinId: req.params.pinId,
-      "collection.name": collectionName,
     });
 
     if (!result) {
+      console.log("⚠ Favorite not found:", req.params.pinId);
       return res.status(404).json({ error: "Favorite not found" });
     }
 
-    res.json({ success: true, message: "Removed" });
+    console.log("✓ Favorite removed:", req.params.pinId);
+
+    res.json({ success: true, message: "Removed from favorites" });
   } catch (err) {
+    console.error("Delete favorite error:", err);
     res.status(500).json({ error: err.message });
   }
 });
 
 app.get("/api/favorites", auth, async (req, res) => {
   try {
-    const filter = { userId: req.user.userId };
+    const favorites = await Favorite.find({ userId: req.user.userId }).sort({ createdAt: -1 });
 
-    if (req.query.name) {
-      filter["collection.name"] = req.query.name;
-    }
+    console.log(`✓ Fetched ${favorites.length} favorites`);
 
-    const favorites = await Favorite.find(filter).sort({ createdAt: -1 });
     res.json({ success: true, favorites });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -1047,8 +930,8 @@ app.get("/api/favorites", auth, async (req, res) => {
 // ── Constants ─────────────────────────────────────────────────────────────────
 
 const SUPPORTED_ASPECT_RATIOS = new Set([
-  "1:1", /*"1:4","1:8",*/ "2:3", "3:2", "3:4", /* "4:1", */ "4:3",
-  "4:5", "5:4", /*"8:1",*/ "9:16", "16:9", "21:9"
+  "1:1", "1:4", "1:8", "2:3", "3:2", "3:4", "4:1", "4:3",
+  "4:5", "5:4", "8:1", "9:16", "16:9", "21:9"
 ]);
 
 const PNG_SIGNATURE = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]);
@@ -1083,25 +966,6 @@ Your task:
 - Maintain the original creative intent and brand aesthetic exactly
 
 Output high-fidelity, print-ready quality.`;
-
-const NATIVE_PATH_SYSTEM_PROMPT = `You are an expert billboard creative adapter. Analyze the source advertisement image and identify its visual hierarchy:
-
-1. PRIMARY FOCAL POINT: The main subject (product, person, or key visual element)
-2. SECONDARY ELEMENTS: Supporting text, taglines, pricing
-3. BRAND IDENTITY: Logos, brand names, social handles
-4. BACKGROUND: Colors, textures, ambient elements
-
-Your task:
-- Redesign the composition to Expand EXACTLY t the newly Requested Aspect ratio 
-- Preserve and EMPHASIZE the primary focal point — it must remain dominant and clear
-- Reposition secondary text so it reads naturally in the new aspect ratio
-- Keep logos and brand elements sharp and legible, never cropped
-- Extend or fill intelligently — match colors, patterns, and lighting seamlessly
-- If upscaling is needed, preserve fine details and text crispness
-- Fill the entirety to the new aspect ratio edge-to-edge. NO letterboxing, NO centered crops, NO black borders
-- Maintain the original creative intent and brand aesthetic exactly
-Output high-fidelity, print-ready quality.`;
-
 
 // ── Utility functions ──────────────────────────────────────────────────────────
 
@@ -1244,31 +1108,228 @@ function checkAspectRatioTolerance(targetWidth, targetHeight, tolerancePct = 5) 
   };
 }
 
-//pngscale
+// ── Pure PNG scaler ────────────────────────────────────────────────────────────
 
-const sharp = require('sharp');
+function decodePngToRgba(base64) {
+  const buffer = Buffer.from(base64, 'base64');
 
-async function scaleToFitAspectRatio(srcBase64, targetWidth, targetHeight) {
-  const inputBuffer = Buffer.from(srcBase64, 'base64');
-  const sharpStart = Date.now();
+  for (let i = 0; i < PNG_SIGNATURE.length; i++) {
+    if (buffer[i] !== PNG_SIGNATURE[i]) throw new Error('Not a valid PNG');
+  }
 
-  const outputBuffer = await sharp(inputBuffer)
-    .resize(targetWidth, targetHeight, {
-      fit: 'fill',        // ← squeezes/stretches to exact dimensions, no cropping
-      kernel: sharp.kernel.lanczos3
-    })
-    .png({
-      compressionLevel:3,
-      effort: 3,
-    })
-    .toBuffer();
+  let offset = 8;
+  let width, height, colorType;
+  const idatChunks = [];
 
-  const sharpEnd = Date.now();
-  console.log(`🔧 Sharp squeeze-to-fit — ${targetWidth}x${targetHeight} | ${sharpEnd - sharpStart}ms`);
+  while (offset < buffer.length) {
+    const length = buffer.readUInt32BE(offset);
+    const type = buffer.toString('ascii', offset + 4, offset + 8);
+    const data = buffer.slice(offset + 8, offset + 8 + length);
 
-  return outputBuffer.toString('base64');
+    if (type === 'IHDR') {
+      width = data.readUInt32BE(0);
+      height = data.readUInt32BE(4);
+      colorType = data[9];
+    } else if (type === 'IDAT') {
+      idatChunks.push(data);
+    } else if (type === 'IEND') {
+      break;
+    }
+
+    offset += 12 + length;
+  }
+
+  if (!width || !height) throw new Error('Failed to parse PNG IHDR');
+
+  const { inflateSync } = require('node:zlib');
+  const raw = inflateSync(Buffer.concat(idatChunks));
+
+  let bytesPerPixel;
+  switch (colorType) {
+    case 0: bytesPerPixel = 1; break; // grayscale
+    case 2: bytesPerPixel = 3; break; // RGB
+    case 3: bytesPerPixel = 1; break; // indexed
+    case 4: bytesPerPixel = 2; break; // grayscale+alpha
+    case 6: bytesPerPixel = 4; break; // RGBA
+    default: throw new Error(`Unsupported PNG color type: ${colorType}`);
+  }
+
+  const pixels = new Uint8Array(width * height * 4);
+  const stride = width * bytesPerPixel;
+
+  function paeth(a, b, c) {
+    const p = a + b - c;
+    const pa = Math.abs(p - a);
+    const pb = Math.abs(p - b);
+    const pc = Math.abs(p - c);
+    return pa <= pb && pa <= pc ? a : pb <= pc ? b : c;
+  }
+
+  let rawOffset = 0;
+  const prevRow = new Uint8Array(stride);
+
+  for (let y = 0; y < height; y++) {
+    const filterType = raw[rawOffset++];
+    const row = new Uint8Array(raw.buffer, raw.byteOffset + rawOffset, stride);
+    rawOffset += stride;
+
+    const currRow = new Uint8Array(stride);
+
+    for (let x = 0; x < stride; x++) {
+      const left = x >= bytesPerPixel ? currRow[x - bytesPerPixel] : 0;
+      const up = prevRow[x];
+      const upLeft = x >= bytesPerPixel ? prevRow[x - bytesPerPixel] : 0;
+
+      switch (filterType) {
+        case 0: currRow[x] = row[x]; break;
+        case 1: currRow[x] = (row[x] + left) & 0xff; break;
+        case 2: currRow[x] = (row[x] + up) & 0xff; break;
+        case 3: currRow[x] = (row[x] + ((left + up) >> 1)) & 0xff; break;
+        case 4: currRow[x] = (row[x] + paeth(left, up, upLeft)) & 0xff; break;
+        default: throw new Error(`Unknown PNG filter: ${filterType}`);
+      }
+    }
+
+    prevRow.set(currRow);
+
+    for (let x = 0; x < width; x++) {
+      const pxOffset = (y * width + x) * 4;
+      const srcOffset = x * bytesPerPixel;
+
+      switch (colorType) {
+        case 0:
+          pixels[pxOffset] = currRow[srcOffset];
+          pixels[pxOffset + 1] = currRow[srcOffset];
+          pixels[pxOffset + 2] = currRow[srcOffset];
+          pixels[pxOffset + 3] = 255;
+          break;
+        case 2:
+          pixels[pxOffset] = currRow[srcOffset];
+          pixels[pxOffset + 1] = currRow[srcOffset + 1];
+          pixels[pxOffset + 2] = currRow[srcOffset + 2];
+          pixels[pxOffset + 3] = 255;
+          break;
+        case 4:
+          pixels[pxOffset] = currRow[srcOffset];
+          pixels[pxOffset + 1] = currRow[srcOffset];
+          pixels[pxOffset + 2] = currRow[srcOffset];
+          pixels[pxOffset + 3] = currRow[srcOffset + 1];
+          break;
+        case 6:
+          pixels[pxOffset] = currRow[srcOffset];
+          pixels[pxOffset + 1] = currRow[srcOffset + 1];
+          pixels[pxOffset + 2] = currRow[srcOffset + 2];
+          pixels[pxOffset + 3] = currRow[srcOffset + 3];
+          break;
+      }
+    }
+  }
+
+  return { width, height, pixels };
 }
 
+function encodeRgbaToPng(pixels, width, height) {
+  const { deflateSync } = require('node:zlib');
+  const stride = width * 4;
+  const rawSize = height * (1 + stride);
+  const raw = Buffer.alloc(rawSize);
+
+  for (let y = 0; y < height; y++) {
+    const rowStart = y * (1 + stride);
+    raw[rowStart] = 0; // filter type: None
+    for (let x = 0; x < stride; x++) {
+      raw[rowStart + 1 + x] = pixels[y * stride + x];
+    }
+  }
+
+  const ihdr = Buffer.alloc(13);
+  ihdr.writeUInt32BE(width, 0);
+  ihdr.writeUInt32BE(height, 4);
+  ihdr[8] = 8;  // bit depth
+  ihdr[9] = 6;  // color type: RGBA
+  ihdr[10] = 0;
+  ihdr[11] = 0;
+  ihdr[12] = 0;
+
+  const png = Buffer.concat([
+    PNG_SIGNATURE,
+    createPngChunk('IHDR', ihdr),
+    createPngChunk('IDAT', deflateSync(raw)),
+    createPngChunk('IEND', Buffer.alloc(0)),
+  ]);
+
+  return png.toString('base64');
+}
+
+function sampleBilinear(pixels, srcWidth, srcHeight, sx, sy) {
+  const x0 = Math.floor(sx);
+  const y0 = Math.floor(sy);
+  const x1 = Math.min(x0 + 1, srcWidth - 1);
+  const y1 = Math.min(y0 + 1, srcHeight - 1);
+  const fx = sx - x0;
+  const fy = sy - y0;
+
+  const result = new Uint8Array(4);
+  for (let c = 0; c < 4; c++) {
+    const tl = pixels[(y0 * srcWidth + x0) * 4 + c];
+    const tr = pixels[(y0 * srcWidth + x1) * 4 + c];
+    const bl = pixels[(y1 * srcWidth + x0) * 4 + c];
+    const br = pixels[(y1 * srcWidth + x1) * 4 + c];
+    result[c] = Math.round(
+      tl * (1 - fx) * (1 - fy) +
+      tr * fx * (1 - fy) +
+      bl * (1 - fx) * fy +
+      br * fx * fy
+    );
+  }
+  return result;
+}
+
+/**
+ * Cover-scales srcBase64 PNG to fill targetWidth x targetHeight exactly.
+ * Composited onto a black canvas. Bilinear interpolation.
+ * Input/output: base64 PNG strings.
+ */
+function pngScaleToFit(srcBase64, targetWidth, targetHeight) {
+  const src = decodePngToRgba(srcBase64);
+
+  const scaleX = targetWidth / src.width;
+  const scaleY = targetHeight / src.height;
+  const scale = Math.max(scaleX, scaleY); // cover — no black bars
+
+  const scaledW = Math.round(src.width * scale);
+  const scaledH = Math.round(src.height * scale);
+
+  const offsetX = Math.round((targetWidth - scaledW) / 2);
+  const offsetY = Math.round((targetHeight - scaledH) / 2);
+
+  // Black opaque canvas
+  const output = new Uint8Array(targetWidth * targetHeight * 4);
+  for (let i = 0; i < output.length; i += 4) {
+    output[i] = 0;
+    output[i + 1] = 0;
+    output[i + 2] = 0;
+    output[i + 3] = 255;
+  }
+
+  for (let y = 0; y < targetHeight; y++) {
+    for (let x = 0; x < targetWidth; x++) {
+      const sx = (x - offsetX) / scale;
+      const sy = (y - offsetY) / scale;
+
+      if (sx < 0 || sy < 0 || sx >= src.width || sy >= src.height) continue;
+
+      const sample = sampleBilinear(src.pixels, src.width, src.height, sx, sy);
+      const outIdx = (y * targetWidth + x) * 4;
+      output[outIdx]     = sample[0];
+      output[outIdx + 1] = sample[1];
+      output[outIdx + 2] = sample[2];
+      output[outIdx + 3] = sample[3];
+    }
+  }
+
+  return encodeRgbaToPng(output, targetWidth, targetHeight);
+}
 
 // ── Cloudinary upload helper ───────────────────────────────────────────────────
 
@@ -1303,7 +1364,6 @@ async function uploadRefitToCloudinary(imageBase64, mimeType, publicIdPrefix) {
 
 async function generateRefitWithGemini(imageUrl, targetWidth, targetHeight) {
   const apiKey = process.env.GEMINI_API_KEY;
-  const overallStart = Date.now();
 
   // Download source image
   const imageResponse = await fetch(imageUrl);
@@ -1328,7 +1388,8 @@ async function generateRefitWithGemini(imageUrl, targetWidth, targetHeight) {
   let requestBody;
 
   if (ratioCheck.withinTolerance) {
-    const finalPrompt = `${NATIVE_PATH_SYSTEM_PROMPT}
+    // Native path: use imageConfig with closest supported ratio + 4K quality
+    const finalPrompt = `${DEFAULT_SYSTEM_PROMPT}
 
 Target output size: ${targetWidth}x${targetHeight}px (${ratioCheck.bestSupportedRatio}).
 Fill the canvas edge-to-edge with no borders.`;
@@ -1342,12 +1403,13 @@ Fill the canvas edge-to-edge with no borders.`;
         responseModalities: ["IMAGE"],
         imageConfig: {
           aspectRatio: ratioCheck.bestSupportedRatio,
-          imageSize: "2k",
+          outputQuality: "QUALITY",
         },
       },
     };
 
   } else {
+    // Canvas path: send blank PNG reference to guide composition
     const referenceCanvas = getReferenceCanvasDimensions(targetWidth, targetHeight);
     const blankBase64 = generateBlankPngBase64(referenceCanvas.width, referenceCanvas.height);
 
@@ -1364,6 +1426,7 @@ The last image is a blank black reference canvas sized ${referenceCanvas.width}x
       ]}],
       generationConfig: {
         responseModalities: ["IMAGE"],
+        // No imageConfig — canvas method only
       },
     };
   }
@@ -1372,7 +1435,6 @@ The last image is a blank black reference canvas sized ${referenceCanvas.width}x
   const projectId = "project-b275f288-bac3-429e-877";
   const region = "global";
   const model = "gemini-3-pro-image-preview";
-  const geminiStart = Date.now();
 
   const response = await fetch(
     `https://aiplatform.googleapis.com/v1/projects/${projectId}/locations/${region}/publishers/google/models/${model}:generateContent?key=${apiKey}`,
@@ -1382,8 +1444,6 @@ The last image is a blank black reference canvas sized ${referenceCanvas.width}x
       body: JSON.stringify(requestBody),
     }
   );
-
-  const geminiEnd = Date.now();
 
   if (!response.ok) {
     const errorText = await response.text();
@@ -1407,16 +1467,10 @@ The last image is a blank black reference canvas sized ${referenceCanvas.width}x
 
   if (!generatedBase64) throw new Error('No image generated by Gemini');
 
-  // NEW: Log raw Gemini output dimensions & size BEFORE png refix
-  const geminiDims = getImageDimensionsFromBase64(generatedBase64);
-  const geminiSizeBytes = Buffer.from(generatedBase64, 'base64').length;
-  console.log(`📊 Gemini raw output — ${geminiDims?.width || '?'}x${geminiDims?.height || '?'} | ${(geminiSizeBytes/1024).toFixed(1)}KB | ${geminiEnd - geminiStart}ms`);
-
   // ── STEP 5: PNG refix ─────────────────────────────────────────────────────
-    // Exact native match → Gemini already output correct ratio, skip refix.
+  // Exact native match → Gemini already output correct ratio, skip refix.
   // Approximated native (within 5%) → refix to exact target dims.
   // Canvas method (>5%) → refix to exact target dims.
-
   let finalBase64 = generatedBase64;
   const needsRefix = !ratioCheck.exactMatch;
 
@@ -1424,25 +1478,15 @@ The last image is a blank black reference canvas sized ${referenceCanvas.width}x
     const reason = !ratioCheck.withinTolerance ? 'canvas method' : 'approximated native ratio';
     console.log(`🖼  Running PNG refix (reason: ${reason})...`);
 
-    const refixStart = Date.now();
-
     if (generatedMime.includes('png')) {
-      finalBase64 = await scaleToFitAspectRatio(generatedBase64, targetWidth, targetHeight);
-      const refixEnd = Date.now();
-
-      // NEW: Log final dimensions & size AFTER sharp processing
-      const finalDims = getImageDimensionsFromBase64(finalBase64);
-      const finalSizeBytes = Buffer.from(finalBase64, 'base64').length;
-      console.log(`✅ PNG refix complete — ${finalDims?.width || '?'}x${finalDims?.height || '?'} | ${(finalSizeBytes/1024).toFixed(1)}KB | ${refixEnd - refixStart}ms`);
+      finalBase64 = pngScaleToFit(generatedBase64, targetWidth, targetHeight);
+      console.log('✅ PNG refix complete');
     } else {
       console.warn('⚠️  Non-PNG output from Gemini — skipping refix');
     }
   } else {
     console.log('✅ Exact native match — no refix needed');
   }
-
-  const overallEnd = Date.now();
-  console.log(`⏱️  Total refit time: ${overallEnd - overallStart}ms`);
 
   return {
     imageBase64: finalBase64,
@@ -1455,78 +1499,7 @@ The last image is a blank black reference canvas sized ${referenceCanvas.width}x
   };
 }
 
-// ── Sharp resize helper ───────────────────────────────────────────────────────
-
-async function scaleToFitAspectRatio(srcBase64, targetWidth, targetHeight) {
-  const inputBuffer = Buffer.from(srcBase64, 'base64');
-  const sharpStart = Date.now();
-
-  const outputBuffer = await sharp(inputBuffer)
-    .resize(targetWidth, targetHeight, {
-      //fit: 'cover',         fills canvas, crops edges to maintain aspect ratio
-      fit: 'fill',      // ← UNCOMMENT THIS INSTEAD IF YOU WANT TO SQUEEZE/STRETCH
-      position: 'centre',
-      kernel: sharp.kernel.lanczos3
-    })
-    .png({
-      compressionLevel: 6,
-      effort: 7,
-    })
-    .toBuffer();
-
-  const sharpEnd = Date.now();
-  console.log(`🔧 Sharp resize — ${targetWidth}x${targetHeight} | ${sharpEnd - sharpStart}ms`);
-
-  return outputBuffer.toString('base64');
-}
-
-
-// ====================== REFIT ENDPOINTS ======================
-
-// AUTH TEST ENDPOINT — full Gemini flow, takes Cloudinary URL
-// POST /api/refit/test
-// Body: { imageUrl, targetWidth, targetHeight }
-app.post('/api/refit/test', auth, async (req, res) => {
-  try {
-    const { imageUrl, targetWidth, targetHeight } = req.body;
-
-    if (!imageUrl || !targetWidth || !targetHeight) {
-      return res.status(400).json({ error: 'Missing imageUrl, targetWidth, or targetHeight' });
-    }
-
-    console.log("=== REFIT TEST ===");
-    console.log("Image:", imageUrl);
-    console.log("Target:", targetWidth, "x", targetHeight);
-
-    const refitResult = await generateRefitWithGemini(
-      imageUrl,
-      parseInt(targetWidth),
-      parseInt(targetHeight)
-    );
-
-    const cloudinaryResult = await uploadRefitToCloudinary(
-      refitResult.imageBase64,
-      refitResult.mimeType,
-      "test"
-    );
-
-    res.json({
-      success: true,
-      refit: {
-        cloudinaryUrl: cloudinaryResult.cloudinaryUrl,
-        publicId: cloudinaryResult.publicId,
-        dimensions: cloudinaryResult.dimensions,
-        aspectRatio: refitResult.aspectRatio,
-        ratioPath: refitResult.ratioPath,
-        refixApplied: refitResult.refixApplied,
-      }
-    });
-
-  } catch (err) {
-    console.error("Refit test error:", err);
-    res.status(500).json({ error: err.message });
-  }
-});
+// ====================== REFIT ENDPOINTS ==================
 
 // PREVIEW ENDPOINT — generate refit and cache on upload
 // POST /api/refit/preview
@@ -1653,7 +1626,7 @@ app.post('/api/refit/placement', auth, async (req, res) => {
 // PNG SCALE TEST (NO AUTH) — test pure PNG scaler in isolation, no Gemini
 // POST /api/refit/png-scale-test
 // multipart: image (PNG file), targetWidth, targetHeight
-app.post('/api/refit/png-scale-test', uploadMemory.single('image'), async (req, res) => {
+app.post('/api/refit/png-scale-test', auth uploadMemory.single('image'), async (req, res) => {
   try {
     if (!req.file) {
       return res.status(400).json({ error: 'No image file uploaded' });
