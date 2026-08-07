@@ -1626,7 +1626,7 @@ app.post('/api/refit/placement', auth, async (req, res) => {
 // PNG SCALE TEST (NO AUTH) — test pure PNG scaler in isolation, no Gemini
 // POST /api/refit/png-scale-test
 // multipart: image (PNG file), targetWidth, targetHeight
-app.post('/api/refit/png-scale-test', auth uploadMemory.single('image'), async (req, res) => {
+app.post('/api/refit/png-scale-test', auth, uploadMemory.single('image'), async (req, res) => {
   try {
     if (!req.file) {
       return res.status(400).json({ error: 'No image file uploaded' });
