@@ -394,6 +394,72 @@ app.post('/api/waitlist', async (req, res) => {
   }
 });
 
+// ====================== PARTNER REQUEST MODEL ======================
+
+const partnerRequestSchema = new mongoose.Schema({
+  type: {
+    type: String,
+    enum: ["media_owner", "ssp"],
+    required: true,
+  },
+  email: {
+    type: String,
+    required: true,
+    lowercase: true,
+    trim: true,
+  },
+  companyName: {
+    type: String,
+    required: true,
+    trim: true,
+  },
+  country: {
+    type: String,
+    required: true,
+    trim: true,
+  },
+  createdAt: {
+    type: Date,
+    default: Date.now,
+  },
+});
+
+const PartnerRequest = mongoose.model("PartnerRequest", partnerRequestSchema);
+
+// ====================== PARTNER REQUEST ROUTE ======================
+
+app.post("/api/partner-requests", async (req, res) => {
+  try {
+    const { type, email, companyName, country } = req.body;
+
+    // Validation
+    if (!type || !["media_owner", "ssp"].includes(type)) {
+      return res.status(400).json({ error: "Partner type must be 'media_owner' or 'ssp'" });
+    }
+
+    if (!email || !companyName || !country) {
+      return res.status(400).json({ error: "Business email, company name, and country are required" });
+    }
+
+    // Save entry to MongoDB
+    const partnerEntry = new PartnerRequest({
+      type,
+      email,
+      companyName,
+      country,
+    });
+
+    await partnerEntry.save();
+
+    res.status(201).json({
+      success: true,
+      message: "Partner request received successfully",
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ====================== PIN ROUTES ======================
 
 app.get("/api/pins", async (req, res) => {
