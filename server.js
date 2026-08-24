@@ -1516,6 +1516,7 @@ DECONSTRUCTION & RECOMPOSITION STEPS:
    - Scale up and reposition the Primary Subject so it anchors one side of the ${targetWidth > targetHeight ? "wide" : "tall"} ${targetRatioStr} frame (${targetWidth > targetHeight ? "right or left third" : "top or bottom third"}).
    - Re-render and align all text, taglines, and logos across the remaining open space, formatted for ${orientationWord} legibility.
    - Re-generate and expand the ambient background textures, colors, and lighting seamlessly across the entire ${referenceCanvas.width}x${referenceCanvas.height}px workspace.
+   - Keep the composition balanced and uncluttered: the subject anchors ONE side, text sits as one clear grouped block in the open space, and generous breathing room separates them — do NOT scatter elements into every corner or edge.
 
 3. STRICT QUALITY CONSTRAINTS:
    - NO letterboxing, NO pillarboxing, and NO remaining black borders.
@@ -2148,49 +2149,69 @@ async function chromaKeyMagenta(inputBuffer) {
 }
 
 // Generate an aligned transparent cutout of one element, cropped to its bbox.
+// Retries once with a reinforced prompt when the first pass comes back empty
+// (common for thin text over gradient backgrounds).
 // Returns { buffer, left, top, width, height } in canvas coordinates, or null.
 async function generateElementCutout(origBase64, mimeType, element, canvasW, canvasH) {
-  try {
-    const [ymin, xmin, ymax, xmax] = element.bbox;
+  const [ymin, xmin, ymax, xmax] = element.bbox;
 
-    const { base64: keyedB64 } = await generateReanimImage([
-      { inlineData: { mimeType, data: origBase64 } },
-      { text: REANIM_CUTOUT_PROMPT(element.label) },
-    ]);
+  const left = Math.round((xmin / 1000) * canvasW);
+  const top = Math.round((ymin / 1000) * canvasH);
+  const width = Math.max(4, Math.min(canvasW - left, Math.round(((xmax - xmin) / 1000) * canvasW)));
+  const height = Math.max(4, Math.min(canvasH - top, Math.round(((ymax - ymin) / 1000) * canvasH)));
 
-    const keyedPng = await chromaKeyMagenta(Buffer.from(keyedB64, "base64"));
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      const promptText = attempt === 0
+        ? REANIM_CUTOUT_PROMPT(element.label)
+        : `${REANIM_CUTOUT_PROMPT(element.label)}
 
-    // Resize back to canvas geometry (Gemini may change output resolution),
-    // then extract the bbox region so alignment matches the original exactly.
-    const aligned = await sharp(keyedPng)
-      .resize(canvasW, canvasH, { fit: "fill" })
-      .png()
-      .toBuffer();
+CRITICAL: Your previous output did not isolate the ${element.label} — the background was not fully magenta. Output ONLY the ${element.label} itself on a flat, solid, pure #FF00FF magenta background. No sky, no gradient, no shadows, no surrounding design — every single pixel that is not part of the ${element.label} must be pure #FF00FF.`;
 
-    const left = Math.round((xmin / 1000) * canvasW);
-    const top = Math.round((ymin / 1000) * canvasH);
-    const width = Math.max(4, Math.min(canvasW - left, Math.round(((xmax - xmin) / 1000) * canvasW)));
-    const height = Math.max(4, Math.min(canvasH - top, Math.round(((ymax - ymin) / 1000) * canvasH)));
+      const { base64: keyedB64 } = await generateReanimImage([
+        { inlineData: { mimeType, data: origBase64 } },
+        { text: promptText },
+      ]);
 
-    const cropped = await sharp(aligned)
-      .extract({ left, top, width, height })
-      .png()
-      .toBuffer();
+      const keyedPng = await chromaKeyMagenta(Buffer.from(keyedB64, "base64"));
 
-    // Reject failed generations: if >92% of pixels are transparent the cutout is empty
-    const stats = await sharp(cropped).stats();
-    const alphaChannelIndex = stats.channels.length - 1;
-    const alphaMean = stats.channels[alphaChannelIndex]?.mean ?? 255;
-    if (alphaMean < 20) {
-      console.warn(`⚠️ Reanimate cutout for "${element.label}" is empty — dropping element`);
+      // Resize back to canvas geometry (Gemini may change output resolution),
+      // then extract the bbox region so alignment matches the original exactly.
+      const aligned = await sharp(keyedPng)
+        .resize(canvasW, canvasH, { fit: "fill" })
+        .png()
+        .toBuffer();
+
+      const cropped = await sharp(aligned)
+        .extract({ left, top, width, height })
+        .png()
+        .toBuffer();
+
+      // Reject failed generations: if the cutout is nearly fully transparent
+      // the isolation failed — retry once with the reinforced prompt.
+      const stats = await sharp(cropped).stats();
+      const alphaChannelIndex = stats.channels.length - 1;
+      const alphaMean = stats.channels[alphaChannelIndex]?.mean ?? 255;
+      if (alphaMean < 20) {
+        if (attempt === 0) {
+          console.warn(`⚠️ Reanimate cutout for "${element.label}" is empty — retrying with reinforced prompt`);
+          continue;
+        }
+        console.warn(`⚠️ Reanimate cutout for "${element.label}" still empty — dropping element`);
+        return null;
+      }
+
+      return { buffer: cropped, left, top, width, height };
+    } catch (err) {
+      if (attempt === 0) {
+        console.error(`⚠️ Reanimate cutout failed for "${element.label}" (${err.message}) — retrying`);
+        continue;
+      }
+      console.error(`⚠️ Reanimate cutout failed for "${element.label}":`, err.message);
       return null;
     }
-
-    return { buffer: cropped, left, top, width, height };
-  } catch (err) {
-    console.error(`⚠️ Reanimate cutout failed for "${element.label}":`, err.message);
-    return null;
   }
+  return null;
 }
 
 // ── Easing / motion math ──────────────────────────────────────────────────────
@@ -2201,10 +2222,10 @@ const easeOutBack = (u) => {
   return 1 + c3 * Math.pow(u - 1, 3) + c1 * Math.pow(u - 1, 2);
 };
 
-// Per-effect transform at time t (seconds). Returns {dx, dy, scaleDeg...}
+// Per-effect transform at time t (seconds). Returns {dx, dy, scale, rotateDeg}.
+// Effects REPEAT: the 2s entrance cycle loops for the full video duration.
 function getElementTransform(element, t, canvasW, canvasH) {
-  const clampedT = Math.min(t, REANIM_ENTRANCE_S);
-  const u = clampedT / REANIM_ENTRANCE_S;
+  const u = (t % REANIM_ENTRANCE_S) / REANIM_ENTRANCE_S;
 
   switch (element.effect) {
     case "bounce": {
@@ -2214,7 +2235,8 @@ function getElementTransform(element, t, canvasW, canvasH) {
       return { dx: 0, dy, scale: 1, rotateDeg: 0 };
     }
     case "slide_right": {
-      const s = Math.min(clampedT / REANIM_SLIDE_T1_S, 1);
+      // Travels in the first 60% of each cycle, rests for the remainder
+      const s = Math.min(u * (REANIM_ENTRANCE_S / REANIM_SLIDE_T1_S), 1);
       const eased = easeOutBack(s); // slight overshoot past target, settles back
       const dx = (1 - eased) * (canvasW - element.rect.left);
       return { dx, dy: 0, scale: 1, rotateDeg: 0 };
@@ -2338,11 +2360,17 @@ async function renderReanimationVideo(baseImageBuffer, layers, canvasW, canvasH)
       composites.push({ input: inBuf, left: inLeft, top: inTop });
     };
 
-    // Write frames asynchronously
+    // Write frames asynchronously.
+    // Motion loops every REANIM_ENTRANCE_S, so only that many frames are
+    // unique — render them once (as compact JPEGs), then write the cycle
+    // repeatedly for the full duration. Cuts render time by ~duration/entrance.
     (async () => {
       try {
-        const totalFrames = REANIM_DURATION_S * REANIM_FPS;
-        // Cache resting buffers per layer so post-entrance frames are cheap
+        const uniqueFrames = REANIM_ENTRANCE_S * REANIM_FPS;   // 60 @ 30fps/2s
+        const cycles = Math.round(REANIM_DURATION_S / REANIM_ENTRANCE_S); // 5
+        const frameBuffers = [];
+
+        // Per-layer transform-buffer cache (wiggle/scale re-render per pose)
         const layerState = layers.map((layer) => ({
           ...layer,
           cachedBuf: null,
@@ -2352,7 +2380,7 @@ async function renderReanimationVideo(baseImageBuffer, layers, canvasW, canvasH)
           restingMeta: null,
         }));
 
-        for (let f = 0; f < totalFrames; f += 1) {
+        for (let f = 0; f < uniqueFrames; f += 1) {
           const t = f / REANIM_FPS;
           const composites = [];
 
@@ -2393,16 +2421,24 @@ async function renderReanimationVideo(baseImageBuffer, layers, canvasW, canvasH)
             );
           }
 
-          const frameRaw = await sharp(baseImageBuffer)
+          const frameBuf = await sharp(baseImageBuffer)
             .composite(composites)
             .flatten({ background: "#000000" })
-            // compressionLevel 0 = store-only PNG: fast to encode, decoded
-            // losslessly by ffmpeg from the image2pipe stream
-            .png({ compressionLevel: 0 })
+            // Compact JPEG — each unique frame is stored once and reused for
+            // every cycle, so memory stays tiny and pipe writes are fast
+            .jpeg({ quality: 95 })
             .toBuffer();
 
-          if (!proc.stdin.write(frameRaw)) {
-            await new Promise((resolve) => proc.stdin.once("drain", resolve));
+          frameBuffers.push(frameBuf);
+          console.log(`🎞  Frame ${f + 1}/${uniqueFrames} rendered`);
+        }
+
+        // Write the looping cycles to ffmpeg
+        for (let c = 0; c < cycles; c += 1) {
+          for (const frameBuf of frameBuffers) {
+            if (!proc.stdin.write(frameBuf)) {
+              await new Promise((resolve) => proc.stdin.once("drain", resolve));
+            }
           }
         }
 
@@ -2452,34 +2488,35 @@ async function runReanimationJob(uploadId, options = {}) {
     console.log(`\n🎬 REANIMATE START — upload ${uploadId} (ratio: ${ratioKey})`);
 
     // ── STEP 0 — Source selection: original vs refit ────────────────────────
-    // If the upload doesn't match the billboard's target aspect ratio, animate
-    // the refit version instead. Reuse the cached refit if present; otherwise
-    // generate one via the existing refit pipeline and persist it in
-    // upload.refits so it is documented and never regenerated.
-    let sourceUrl = upload.cloudinaryUrl;
-    let sourceKind = "original";
-
+    // The animated video must be a 100% EXACT ratio match with the billboard —
+    // it is never scaled. So the original is used only when its simplified
+    // ratio equals the target ratio key exactly; anything else goes through
+    // refit (cached if present, otherwise generated: Gemini regen + PNG refix
+    // seals the exact dims). The 5% tolerance only ever applies INSIDE the
+    // refit generator's native-path decision.
     const tw = parseInt(targetWidth);
     const th = parseInt(targetHeight);
     const hasTarget = Number.isFinite(tw) && Number.isFinite(th) && tw > 0 && th > 0;
 
-    if (
-      hasTarget &&
-      upload.dimensions?.width &&
-      upload.dimensions?.height
-    ) {
-      const srcAR = upload.dimensions.width / upload.dimensions.height;
-      const tgtAR = tw / th;
-      const mismatched = Math.abs(srcAR - tgtAR) > 0.05 * tgtAR;
+    // Download the ORIGINAL first and measure its real pixel dims — the DB
+    // dims can drift from the actual asset.
+    let sourceBuffer = await fetchImageAsBuffer(upload.cloudinaryUrl);
+    let sourceKind = "original";
+    let sourceMeta = await sharp(sourceBuffer).metadata();
 
-      if (mismatched) {
+    if (hasTarget && sourceMeta.width && sourceMeta.height) {
+      const exactMatch =
+        simplifyAspectRatio(sourceMeta.width, sourceMeta.height) === ratioKey;
+
+      if (!exactMatch) {
         const existingRefit = upload.refits?.get(ratioKey);
         if (existingRefit?.cloudinaryUrl) {
-          sourceUrl = existingRefit.cloudinaryUrl;
+          sourceBuffer = await fetchImageAsBuffer(existingRefit.cloudinaryUrl);
+          sourceMeta = await sharp(sourceBuffer).metadata();
           sourceKind = "refit";
-          console.log(`📐 Aspect mismatch — using cached refit for ${ratioKey}`);
+          console.log(`📐 Not an exact ${ratioKey} match — using cached refit (100% ratio)`);
         } else {
-          console.log(`📐 Aspect mismatch — generating refit for ${ratioKey} first`);
+          console.log(`📐 Not an exact ${ratioKey} match — generating refit first`);
           const refitResult = await generateRefitWithGemini(upload.cloudinaryUrl, tw, th);
           const cloudRefit = await uploadRefitToCloudinary(
             refitResult.imageBase64,
@@ -2494,16 +2531,15 @@ async function runReanimationJob(uploadId, options = {}) {
             createdAt: new Date()
           });
           await upload.save();
-          sourceUrl = cloudRefit.cloudinaryUrl;
+          sourceBuffer = await fetchImageAsBuffer(cloudRefit.cloudinaryUrl);
+          sourceMeta = await sharp(sourceBuffer).metadata();
           sourceKind = "refit";
-          console.log(`✅ Refit generated and cached under ${ratioKey}`);
+          console.log(`✅ Refit generated and cached under ${ratioKey} (100% ratio)`);
         }
       }
     }
 
-    // ── Canvas geometry from the ACTUAL source image ─────────────────────────
-    const sourceBuffer = await fetchImageAsBuffer(sourceUrl);
-    const sourceMeta = await sharp(sourceBuffer).metadata();
+    // ── Canvas geometry + base64 from the ACTUAL source image ────────────────
     const mimeType = sourceMeta.format === "png" ? "image/png" : "image/jpeg";
     const sourceBase64 = sourceBuffer.toString("base64");
 
@@ -2529,12 +2565,26 @@ async function runReanimationJob(uploadId, options = {}) {
       };
     }
 
-    // STEP 2 — Clean plate (fallback: original image if edit fails)
+    // STEP 2 — Cutouts (sequential — respects the shared Gemini image quota).
+    // Done BEFORE the clean plate so only elements that successfully cut out
+    // are removed from the base — a failed cutout no longer erases the
+    // element from the design (that's what made text vanish).
+    const cutouts = [];
+    for (const el of elements) {
+      const cutout = await generateElementCutout(sourceBase64, mimeType, el, canvasW, canvasH);
+      if (cutout) cutouts.push({ element: el, cutout });
+    }
+
+    if (cutouts.length === 0) throw new Error("All element cutouts failed");
+    console.log(`✂️  ${cutouts.length}/${elements.length} cutouts ready`);
+
+    // STEP 3 — Clean plate: remove ONLY the successfully cut-out elements
+    // (fallback: original image if edit fails)
     let baseImageBuffer = sourceBuffer;
     try {
       const cleanPlate = await generateReanimImage([
         { inlineData: { mimeType, data: sourceBase64 } },
-        { text: REANIM_CLEAN_PLATE_PROMPT(elements.map((e) => e.label)) },
+        { text: REANIM_CLEAN_PLATE_PROMPT(cutouts.map((c) => c.element.label)) },
       ]);
       baseImageBuffer = await sharp(Buffer.from(cleanPlate.base64, "base64"))
         .resize(canvasW, canvasH, { fit: "fill" })
@@ -2549,16 +2599,6 @@ async function runReanimationJob(uploadId, options = {}) {
         .jpeg({ quality: 92 })
         .toBuffer();
     }
-
-    // STEP 3 — Cutouts (sequential — respects the shared Gemini image quota)
-    const cutouts = [];
-    for (const el of elements) {
-      const cutout = await generateElementCutout(sourceBase64, mimeType, el, canvasW, canvasH);
-      if (cutout) cutouts.push({ element: el, cutout });
-    }
-
-    if (cutouts.length === 0) throw new Error("All element cutouts failed");
-    console.log(`✂️  ${cutouts.length}/${elements.length} cutouts ready`);
 
     // STEP 4 — Render MP4
     const mp4Buffer = await renderReanimationVideo(
