@@ -1,5 +1,3 @@
-
-
 const express = require("express");
 const http = require("http");
 const socketIo = require("socket.io");
@@ -159,6 +157,21 @@ const Upload = mongoose.model(
           createdAt: Date
         },
         default: new Map()
+      },
+      reanimations: {
+        type: Map,
+        of: {
+          status: { type: String, enum: ["processing", "completed", "failed"] },
+          videoUrl: String,
+          publicId: String,
+          durationSec: Number,
+          width: Number,
+          height: Number,
+          elements: { type: Array, default: undefined },
+          error: String,
+          createdAt: Date
+        },
+        default: new Map()
       }
     },
     { timestamps: true }
@@ -260,10 +273,14 @@ const optionalAuth = (req, res, next) => {
   try {
     req.user = jwt.verify(token, process.env.JWT_SECRET);
     console.log(`✅ Token OK → role: ${req.user.role}, userId: ${req.user.userId}`);
+    return next();
   } catch (err) {
-    console.log("⚠️ Invalid/expired token");
+    // A token was presented but is invalid or expired → reject so the
+    // client can detect session expiry instead of silently getting
+    // empty/public data.
+    console.log("⛔ Invalid/expired token → 401");
+    return res.status(401).json({ error: "Invalid or expired token" });
   }
-  next();
 };
 
 // ====================== AUTH ROUTES ======================
@@ -302,7 +319,7 @@ app.post("/api/auth/register", async (req, res) => {
     const accessToken = jwt.sign(
       { userId: user._id, role: user.role, organizationName: user.organizationName },
       process.env.JWT_SECRET,
-      { expiresIn: "5d" },
+      { expiresIn: "1h" },
     );
 
     const refreshToken = jwt.sign(
@@ -358,6 +375,49 @@ app.post("/api/auth/login", async (req, res) => {
     });
   } catch (err) {
     res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/auth/refresh
+// Exchanges a valid refresh token for a fresh access token (+ rolled refresh token).
+app.post("/api/auth/refresh", async (req, res) => {
+  const { refreshToken } = req.body;
+  if (!refreshToken) return res.status(401).json({ error: "No refresh token" });
+
+  const refreshSecret = process.env.JWT_REFRESH_SECRET;
+  if (!refreshSecret) {
+    console.error("⛔ JWT_REFRESH_SECRET is not configured — refusing to refresh");
+    return res.status(500).json({ error: "Server auth misconfigured" });
+  }
+
+  try {
+    const decoded = jwt.verify(refreshToken, refreshSecret);
+
+    const user = await User.findById(decoded.userId);
+    if (!user) return res.status(401).json({ error: "User not found" });
+
+    const accessToken = jwt.sign(
+      { userId: user._id, role: user.role, organizationName: user.organizationName },
+      process.env.JWT_SECRET,
+      { expiresIn: "1h" },
+    );
+
+    const newRefreshToken = jwt.sign(
+      { userId: user._id },
+      refreshSecret,
+      { expiresIn: "7d" },
+    );
+
+    res.json({
+      accessToken,
+      refreshToken: newRefreshToken,
+      role: user.role,
+      organizationName: user.organizationName,
+      businessAbout: user.businessAbout,
+      message: "Token refreshed",
+    });
+  } catch (err) {
+    res.status(401).json({ error: "Invalid or expired refresh token" });
   }
 });
 
@@ -810,6 +870,7 @@ app.delete("/api/campaigns/:id", auth, async (req, res) => {
     for (const u of uploads) {
       try { await cloudinary.uploader.destroy(u.publicId); } catch (e) {}
       if (u.refits) { for (const [, refit] of u.refits) { try { if (refit.publicId) await cloudinary.uploader.destroy(refit.publicId); } catch (e) {} } }
+      if (u.reanimations) { for (const [, reanim] of u.reanimations) { try { if (reanim.publicId && reanim.status === 'completed') await cloudinary.uploader.destroy(reanim.publicId, { resource_type: 'video' }); } catch (e) {} } }
     }
     await Upload.deleteMany({ campaignId: req.params.id, userId: req.user.userId });
     await Placement.deleteMany({ campaignId: req.params.id, userId: req.user.userId });
@@ -828,6 +889,7 @@ app.delete("/api/uploads/:id", auth, async (req, res) => {
     if (!uploadDoc) return res.status(404).json({ error: "Upload not found" });
     try { await cloudinary.uploader.destroy(uploadDoc.publicId); } catch (e) {}
     if (uploadDoc.refits) { for (const [, refit] of uploadDoc.refits) { try { if (refit.publicId) await cloudinary.uploader.destroy(refit.publicId); } catch (e) {} } }
+    if (uploadDoc.reanimations) { for (const [, reanim] of uploadDoc.reanimations) { try { if (reanim.publicId && reanim.status === 'completed') await cloudinary.uploader.destroy(reanim.publicId, { resource_type: 'video' }); } catch (e) {} } }
     const campaign = await Campaign.findOne({ _id: uploadDoc.campaignId, userId: req.user.userId });
     if (campaign && campaign.uploadedCreative === uploadDoc.cloudinaryUrl) {
       const nextUpload = await Upload.findOne({ campaignId: uploadDoc.campaignId, userId: req.user.userId, _id: { $ne: req.params.id } }).sort({ createdAt: -1 });
@@ -1785,7 +1847,629 @@ app.post('/api/refit/png-scale-test', uploadMemory.single('image'), async (req, 
   }
 });
 
-// ====================== START SERVER ======================
+// ====================== REANIMATE SYSTEM ======================
+
+// Takes a static creative, detects interesting elements (text / objects) with
+// Gemini, cuts them out (Gemini image edit + magenta chroma key), then renders
+// a looping MP4 where each element animates in over 2s and settles:
+//   text    → slide from right / wiggle / scale bounce
+//   objects → damped-sine bounce
+
+// ── Constants ─────────────────────────────────────────────────────────────────
+
+const REANIM_FPS = 30;
+const REANIM_DURATION_S = 10;      // total video length
+const REANIM_ENTRANCE_S = 2;       // window in which all effects animate + settle
+const REANIM_SLIDE_T1_S = 1.2;     // slide-from-right travel time
+const REANIM_MAX_ELEMENTS = 4;
+const REANIM_MAX_SIDE = 1280;      // render canvas cap for speed
+const REANIM_CACHE_KEY = "default";
+
+const REANIM_DETECTION_PROMPT = `You are a motion director for billboard advertisements. Analyze the advertisement image and pick the most visually interesting elements to animate.
+
+Rules:
+- Select at most ${REANIM_MAX_ELEMENTS} elements. Fewer is fine.
+- Good candidates: product objects (cup, bottle, phone), headline text blocks, taglines, price tags, logos.
+- NEVER select: people, faces, hands, body parts, or the background.
+- Each element must occupy at least 1% of the image area. Skip tiny details.
+- Do not select elements that overlap each other heavily.
+
+Effect assignment:
+- "object" type → effect must be "bounce".
+- "text" type → choose ONE of "slide_right" (best for headlines/taglines), "wiggle" (short punchy words, badges), or "scale_bounce" (prices, CTAs, short emphasis words).
+
+Bounding box format: [ymin, xmin, ymax, xmax] with all values normalized 0-1000 relative to image dimensions.`;
+
+const REANIM_CLEAN_PLATE_PROMPT = (labels) => `Edit this advertisement image. Completely remove the following elements and reconstruct the background behind them naturally so no trace remains: ${labels.join(", ")}.
+
+Keep everything else EXACTLY identical: same framing, same camera position, same resolution and aspect ratio, same colors, same lighting, same remaining text and objects pixel-for-pixel. Only remove the listed elements and fill in the background behind them seamlessly.`;
+
+const REANIM_CUTOUT_PROMPT = (label) => `Edit this advertisement image. Output the SAME image with the SAME framing, composition, camera position, aspect ratio and resolution — but replace EVERYTHING EXCEPT the ${label} with flat pure solid magenta color #FF00FF.
+
+The ${label} itself must remain completely untouched at its exact original position, scale, orientation and appearance. Every other pixel must become pure flat #FF00FF magenta with no gradients, no shadows, no anti-aliasing halos around the ${label}.`;
+
+// ── Gemini helpers ────────────────────────────────────────────────────────────
+
+function reanimGeminiUrl(model) {
+  const projectId = "project-b275f288-bac3-429e-877";
+  return `https://aiplatform.googleapis.com/v1/projects/${projectId}/locations/global/publishers/google/models/${model}:generateContent?key=${process.env.GEMINI_API_KEY}`;
+}
+
+async function fetchImageAsBuffer(imageUrl) {
+  const response = await fetch(imageUrl);
+  if (!response.ok) throw new Error(`Failed to download image: ${response.status}`);
+  return Buffer.from(await response.arrayBuffer());
+}
+
+// Vision model call returning structured JSON element plan
+async function detectReanimateElements(imageBase64, mimeType) {
+  const requestBody = {
+    contents: [{ role: "user", parts: [
+      { inlineData: { mimeType, data: imageBase64 } },
+      { text: REANIM_DETECTION_PROMPT },
+    ]}],
+    generationConfig: {
+      temperature: 0.2,
+      responseMimeType: "application/json",
+      responseSchema: {
+        type: "OBJECT",
+        properties: {
+          elements: {
+            type: "ARRAY",
+            items: {
+              type: "OBJECT",
+              properties: {
+                type: { type: "STRING", enum: ["text", "object"] },
+                label: { type: "STRING" },
+                effect: { type: "STRING", enum: ["bounce", "wiggle", "scale_bounce", "slide_right"] },
+                bbox: { type: "ARRAY", items: { type: "INTEGER" } },
+              },
+              required: ["type", "label", "effect", "bbox"],
+            },
+          },
+        },
+        required: ["elements"],
+      },
+    },
+  };
+
+  const response = await fetch(reanimGeminiUrl("gemini-2.5-flash"), {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(requestBody),
+  });
+
+  if (!response.ok) {
+    throw new Error(`Gemini detection error (${response.status}): ${await response.text()}`);
+  }
+
+  const result = await response.json();
+  const textPart = result.candidates?.[0]?.content?.parts?.find((p) => p.text);
+  if (!textPart) throw new Error("No JSON content in Gemini detection response");
+
+  let parsed;
+  try { parsed = JSON.parse(textPart.text); }
+  catch { throw new Error("Gemini detection returned invalid JSON"); }
+
+  // Post-process: clamp bboxes, drop tiny/heavily-overlapping elements, cap count
+  const cleaned = [];
+  for (const el of Array.isArray(parsed.elements) ? parsed.elements : []) {
+    if (!Array.isArray(el.bbox) || el.bbox.length !== 4) continue;
+    const [ymin, xmin, ymax, xmax] = el.bbox.map((v) => Math.max(0, Math.min(1000, Number(v) || 0)));
+    const areaPct = ((ymax - ymin) * (xmax - xmin)) / 10000;
+    if (areaPct < 1) continue;
+    if (cleaned.length >= REANIM_MAX_ELEMENTS) break;
+
+    let overlaps = false;
+    for (const kept of cleaned) {
+      const ix = Math.max(0, Math.min(xmax, kept.bbox[3]) - Math.max(xmin, kept.bbox[1]));
+      const iy = Math.max(0, Math.min(ymax, kept.bbox[2]) - Math.max(ymin, kept.bbox[0]));
+      const inter = ix * iy;
+      const union = areaPct + (((kept.bbox[2] - kept.bbox[0]) * (kept.bbox[3] - kept.bbox[1])) / 10000) - inter;
+      if (union > 0 && inter / union > 0.35) { overlaps = true; break; }
+    }
+    if (overlaps) continue;
+
+    cleaned.push({
+      type: el.type === "object" ? "object" : "text",
+      label: String(el.label || (el.type === "object" ? "object" : "text")).slice(0, 60),
+      effect: el.type === "object" ? "bounce" : (["slide_right", "wiggle", "scale_bounce"].includes(el.effect) ? el.effect : "slide_right"),
+      bbox: [ymin, xmin, ymax, xmax],
+    });
+  }
+
+  return cleaned;
+}
+
+// Image-editing model call — returns generated image base64
+async function generateReanimImage(parts) {
+  const response = await fetch(reanimGeminiUrl("gemini-3-pro-image-preview"), {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      contents: [{ role: "user", parts }],
+      generationConfig: { responseModalities: ["IMAGE"] },
+    }),
+  });
+
+  if (!response.ok) {
+    throw new Error(`Gemini image error (${response.status}): ${await response.text()}`);
+  }
+
+  const result = await response.json();
+  for (const part of result.candidates?.[0]?.content?.parts || []) {
+    if (part.inlineData?.data) {
+      return { base64: part.inlineData.data, mimeType: part.inlineData.mimeType || "image/png" };
+    }
+  }
+  throw new Error("No image in Gemini edit response");
+}
+
+// ── Cutout helpers (magenta chroma key via sharp) ─────────────────────────────
+
+async function chromaKeyMagenta(inputBuffer) {
+  const { data, info } = await sharp(inputBuffer)
+    .ensureAlpha()
+    .raw()
+    .toBuffer({ resolveWithObject: true });
+
+  const { width, height, channels } = info;
+  for (let i = 0; i < data.length; i += channels) {
+    const r = data[i], g = data[i + 1], b = data[i + 2];
+    // Distance from pure magenta (255, 0, 255)
+    const dist = Math.sqrt((255 - r) ** 2 + g ** 2 + (255 - b) ** 2);
+    if (dist < 110) {
+      data[i + 3] = 0;
+    } else if (dist < 175) {
+      // Soft edge feather between the thresholds
+      data[i + 3] = Math.round(data[i + 3] * ((dist - 110) / 65));
+    }
+  }
+
+  return sharp(data, { raw: { width, height, channels } })
+    .png()
+    .toBuffer();
+}
+
+// Generate an aligned transparent cutout of one element, cropped to its bbox.
+// Returns { buffer, left, top, width, height } in canvas coordinates, or null.
+async function generateElementCutout(origBase64, mimeType, element, canvasW, canvasH) {
+  try {
+    const [ymin, xmin, ymax, xmax] = element.bbox;
+
+    const { base64: keyedB64 } = await generateReanimImage([
+      { inlineData: { mimeType, data: origBase64 } },
+      { text: REANIM_CUTOUT_PROMPT(element.label) },
+    ]);
+
+    const keyedPng = await chromaKeyMagenta(Buffer.from(keyedB64, "base64"));
+
+    // Resize back to canvas geometry (Gemini may change output resolution),
+    // then extract the bbox region so alignment matches the original exactly.
+    const aligned = await sharp(keyedPng)
+      .resize(canvasW, canvasH, { fit: "fill" })
+      .png()
+      .toBuffer();
+
+    const left = Math.round((xmin / 1000) * canvasW);
+    const top = Math.round((ymin / 1000) * canvasH);
+    const width = Math.max(4, Math.min(canvasW - left, Math.round(((xmax - xmin) / 1000) * canvasW)));
+    const height = Math.max(4, Math.min(canvasH - top, Math.round(((ymax - ymin) / 1000) * canvasH)));
+
+    const cropped = await sharp(aligned)
+      .extract({ left, top, width, height })
+      .png()
+      .toBuffer();
+
+    // Reject failed generations: if >92% of pixels are transparent the cutout is empty
+    const stats = await sharp(cropped).stats();
+    const alphaChannelIndex = stats.channels.length - 1;
+    const alphaMean = stats.channels[alphaChannelIndex]?.mean ?? 255;
+    if (alphaMean < 20) {
+      console.warn(`⚠️ Reanimate cutout for "${element.label}" is empty — dropping element`);
+      return null;
+    }
+
+    return { buffer: cropped, left, top, width, height };
+  } catch (err) {
+    console.error(`⚠️ Reanimate cutout failed for "${element.label}":`, err.message);
+    return null;
+  }
+}
+
+// ── Easing / motion math ──────────────────────────────────────────────────────
+
+const easeOutBack = (u) => {
+  const c1 = 1.70158;
+  const c3 = c1 + 1;
+  return 1 + c3 * Math.pow(u - 1, 3) + c1 * Math.pow(u - 1, 2);
+};
+
+// Per-effect transform at time t (seconds). Returns {dx, dy, scaleDeg...}
+function getElementTransform(element, t, canvasW, canvasH) {
+  const clampedT = Math.min(t, REANIM_ENTRANCE_S);
+  const u = clampedT / REANIM_ENTRANCE_S;
+
+  switch (element.effect) {
+    case "bounce": {
+      // Drop from above into place with one damped overshoot below
+      const A = canvasH * 0.10;
+      const dy = -A * Math.exp(-4 * u) * Math.cos(10 * u);
+      return { dx: 0, dy, scale: 1, rotateDeg: 0 };
+    }
+    case "slide_right": {
+      const s = Math.min(clampedT / REANIM_SLIDE_T1_S, 1);
+      const eased = easeOutBack(s); // slight overshoot past target, settles back
+      const dx = (1 - eased) * (canvasW - element.rect.left);
+      return { dx, dy: 0, scale: 1, rotateDeg: 0 };
+    }
+    case "wiggle": {
+      const rotateDeg = 4 * Math.exp(-3 * u) * Math.sin(14 * u);
+      return { dx: 0, dy: 0, scale: 1, rotateDeg };
+    }
+    case "scale_bounce": {
+      const scale = 1 + 0.45 * Math.exp(-4 * u) * (-Math.cos(10 * u));
+      return { dx: 0, dy: 0, scale, rotateDeg: 0 };
+    }
+    default:
+      return { dx: 0, dy: 0, scale: 1, rotateDeg: 0 };
+  }
+}
+
+function transformIsResting(transform) {
+  return (
+    Math.abs(transform.dx) < 0.5 &&
+    Math.abs(transform.dy) < 0.5 &&
+    Math.abs(transform.rotateDeg) < 0.05 &&
+    Math.abs(transform.scale - 1) < 0.002
+  );
+}
+
+// Render a transformed layer buffer (scaled/rotated cutout) anchored to center
+async function renderLayerBuffer(cutout, transform) {
+  const scaledW = Math.max(2, Math.round(cutout.width * transform.scale));
+  const scaledH = Math.max(2, Math.round(cutout.height * transform.scale));
+
+  let pipe = sharp(cutout.buffer).resize(scaledW, scaledH, { fit: "fill" });
+  if (Math.abs(transform.rotateDeg) > 0.05) {
+    pipe = pipe.rotate(transform.rotateDeg, { background: { r: 0, g: 0, b: 0, alpha: 0 } });
+  }
+  return pipe.png().toBuffer();
+}
+
+// ── Frame renderer + FFmpeg encoder ───────────────────────────────────────────
+
+function resolveFfmpegPath() {
+  try {
+    const ffmpegStatic = require("ffmpeg-static");
+    if (ffmpegStatic) return ffmpegStatic;
+  } catch { /* fall through to system binary */ }
+  return "ffmpeg";
+}
+
+async function renderReanimationVideo(baseImageBuffer, layers, canvasW, canvasH) {
+  const { spawn } = require("child_process");
+  const os = require("os");
+  const path = require("path");
+  const fs = require("fs");
+
+  const outputPath = path.join(os.tmpdir(), `reanim_${Date.now()}_${Math.random().toString(36).slice(2)}.mp4`);
+  const ffmpegPath = resolveFfmpegPath();
+
+  const ffmpegArgs = [
+    "-y",
+    "-f", "rawvideo",
+    "-pix_fmt", "rgb24",
+    "-s", `${canvasW}x${canvasH}`,
+    "-r", String(REANIM_FPS),
+    "-i", "-",
+    "-c:v", "libx264",
+    "-preset", "medium",
+    "-crf", "22",
+    "-pix_fmt", "yuv420p",
+    "-movflags", "+faststart",
+    outputPath,
+  ];
+
+  return new Promise((resolve, reject) => {
+    const proc = spawn(ffmpegPath, ffmpegArgs);
+    let stderr = "";
+
+    proc.stderr.on("data", (d) => { stderr += d.toString(); if (stderr.length > 8000) stderr = stderr.slice(-4000); });
+    proc.on("error", reject);
+    // Prevent unhandled EPIPE if ffmpeg dies while we are mid-write
+    if (proc.stdin) proc.stdin.on("error", () => {});
+    proc.on("close", (code) => {
+      if (code === 0) {
+        fs.readFile(outputPath, (readErr, mp4Buffer) => {
+          fs.unlink(outputPath, () => {});
+          if (readErr) reject(readErr); else resolve(mp4Buffer);
+        });
+      } else {
+        reject(new Error(`ffmpeg exited ${code}: ${stderr.slice(-1500)}`));
+      }
+    });
+
+    // Push one layer into the frame's composite list, clipping it to the canvas.
+    // sharp composite offsets must stay in-bounds, so off-screen portions are
+    // cropped from the layer buffer first (needed for slide_from_right start).
+    const pushComposite = async (composites, buf, meta, left, top) => {
+      const cw = canvasW;
+      const chh = canvasH;
+      if (left >= cw || top >= chh || left + meta.width <= 0 || top + meta.height <= 0) return;
+
+      let inBuf = buf;
+      let inLeft = left;
+      let inTop = top;
+
+      if (inLeft < 0 || inTop < 0 || inLeft + meta.width > cw || inTop + meta.height > chh) {
+        const cropLeft = Math.max(0, -inLeft);
+        const cropTop = Math.max(0, -inTop);
+        const newLeft = Math.max(0, inLeft);
+        const newTop = Math.max(0, inTop);
+        const cropW = Math.min(meta.width - cropLeft, cw - newLeft);
+        const cropH = Math.min(meta.height - cropTop, chh - newTop);
+        if (cropW < 2 || cropH < 2) return;
+        inBuf = await sharp(buf)
+          .extract({ left: cropLeft, top: cropTop, width: cropW, height: cropH })
+          .png()
+          .toBuffer();
+        inLeft = newLeft;
+        inTop = newTop;
+      }
+
+      composites.push({ input: inBuf, left: inLeft, top: inTop });
+    };
+
+    // Write frames asynchronously
+    (async () => {
+      try {
+        const totalFrames = REANIM_DURATION_S * REANIM_FPS;
+        // Cache resting buffers per layer so post-entrance frames are cheap
+        const layerState = layers.map((layer) => ({
+          ...layer,
+          cachedBuf: null,
+          cachedMeta: null,
+          cachedSig: "",
+          restingBuf: null,
+          restingMeta: null,
+        }));
+
+        for (let f = 0; f < totalFrames; f += 1) {
+          const t = f / REANIM_FPS;
+          const composites = [];
+
+          for (const state of layerState) {
+            const transform = getElementTransform(state.element, t, canvasW, canvasH);
+            const resting = transformIsResting(transform);
+            const sig = `${transform.scale.toFixed(4)}_${transform.rotateDeg.toFixed(3)}`;
+
+            let buf;
+            if (resting) {
+              // Identity transform — render/cache once
+              if (!state.restingBuf) {
+                state.restingBuf = await renderLayerBuffer(state.cutout, { dx: 0, dy: 0, scale: 1, rotateDeg: 0 });
+                state.restingMeta = await sharp(state.restingBuf).metadata();
+              }
+              buf = state.restingBuf;
+            } else {
+              if (sig !== state.cachedSig) {
+                state.cachedBuf = await renderLayerBuffer(state.cutout, transform);
+                state.cachedMeta = await sharp(state.cachedBuf).metadata();
+                state.cachedSig = sig;
+              }
+              buf = state.cachedBuf;
+            }
+            if (!buf) continue;
+
+            const meta = resting ? state.restingMeta : state.cachedMeta;
+
+            // Anchor transformed buffer to the cutout's center point
+            const centerX = state.cutout.left + state.cutout.width / 2 + transform.dx;
+            const centerY = state.cutout.top + state.cutout.height / 2 + transform.dy;
+            await pushComposite(
+              composites,
+              buf,
+              meta,
+              Math.round(centerX - meta.width / 2),
+              Math.round(centerY - meta.height / 2),
+            );
+          }
+
+          const frameRaw = await sharp(baseImageBuffer)
+            .composite(composites)
+            .flatten({ background: "#000000" })
+            .raw()
+            .toBuffer();
+
+          if (!proc.stdin.write(frameRaw)) {
+            await new Promise((resolve) => proc.stdin.once("drain", resolve));
+          }
+        }
+
+        proc.stdin.end();
+      } catch (err) {
+        proc.kill("SIGKILL");
+        reject(err);
+      }
+    })();
+  });
+}
+
+// ── Cloudinary video upload helper ────────────────────────────────────────────
+
+async function uploadReanimationToCloudinary(mp4Buffer, publicIdPrefix) {
+  const fs = require("fs");
+  const os = require("os");
+  const path = require("path");
+  const tempPath = path.join(os.tmpdir(), `reanim_upload_${Date.now()}.mp4`);
+
+  fs.writeFileSync(tempPath, mp4Buffer);
+  try {
+    const result = await cloudinary.uploader.upload(tempPath, {
+      folder: "reanimations",
+      public_id: `${publicIdPrefix}_reanimate_${Date.now()}`,
+      resource_type: "video",
+    });
+    return { videoUrl: result.secure_url, publicId: result.public_id, width: result.width, height: result.height };
+  } finally {
+    if (fs.existsSync(tempPath)) fs.unlinkSync(tempPath);
+  }
+}
+
+// ── Full pipeline (runs async after POST responds 202) ────────────────────────
+
+const reanimRunningSet = new Set(); // uploadIds with a job in flight
+
+async function runReanimationJob(uploadId) {
+  const startedAt = Date.now();
+  reanimRunningSet.add(uploadId);
+
+  try {
+    const upload = await Upload.findById(uploadId);
+    if (!upload) return;
+
+    console.log(`\n🎬 REANIMATE START — upload ${uploadId}`);
+
+    // Canvas geometry
+    const srcW = upload.dimensions?.width || 1080;
+    const srcH = upload.dimensions?.height || 1080;
+    const scaleDown = Math.min(1, REANIM_MAX_SIDE / Math.max(srcW, srcH));
+    const canvasW = Math.max(2, Math.round((srcW * scaleDown) / 2) * 2);
+    const canvasH = Math.max(2, Math.round((srcH * scaleDown) / 2) * 2);
+
+    const sourceBuffer = await fetchImageAsBuffer(upload.cloudinaryUrl);
+    const mimeType = upload.format === "png" ? "image/png" : "image/jpeg";
+    const sourceBase64 = sourceBuffer.toString("base64");
+
+    // STEP 1 — Detect elements
+    const elements = await detectReanimateElements(sourceBase64, mimeType);
+    if (elements.length === 0) throw new Error("No animatable elements detected");
+    console.log(`🎯 Detected ${elements.length} elements:`, elements.map((e) => `${e.label}→${e.effect}`).join(", "));
+
+    // Attach pixel rects used by motion math
+    for (const el of elements) {
+      const [ymin, xmin, ymax, xmax] = el.bbox;
+      el.rect = {
+        left: Math.round((xmin / 1000) * canvasW),
+        top: Math.round((ymin / 1000) * canvasH),
+        width: Math.max(4, Math.round(((xmax - xmin) / 1000) * canvasW)),
+        height: Math.max(4, Math.round(((ymax - ymin) / 1000) * canvasH)),
+      };
+    }
+
+    // STEP 2 — Clean plate (fallback: original image if edit fails)
+    let baseImageBuffer = sourceBuffer;
+    try {
+      const cleanPlate = await generateReanimImage([
+        { inlineData: { mimeType, data: sourceBase64 } },
+        { text: REANIM_CLEAN_PLATE_PROMPT(elements.map((e) => e.label)) },
+      ]);
+      baseImageBuffer = await sharp(Buffer.from(cleanPlate.base64, "base64"))
+        .resize(canvasW, canvasH, { fit: "fill" })
+        .jpeg({ quality: 92 })
+        .toBuffer();
+      console.log("🧽 Clean plate ready");
+    } catch (err) {
+      console.warn("⚠️ Clean plate generation failed — using original as base:", err.message);
+      baseImageBuffer = await sharp(sourceBuffer)
+        .resize(canvasW, canvasH, { fit: "fill" })
+        .flatten({ background: "#000000" })
+        .jpeg({ quality: 92 })
+        .toBuffer();
+    }
+
+    // STEP 3 — Cutouts (parallel per element, drop failures)
+    const cutouts = (await Promise.all(
+      elements.map((el) => generateElementCutout(sourceBase64, mimeType, el, canvasW, canvasH)),
+    )).map((cutout, idx) => (cutout ? { element: elements[idx], cutout } : null)).filter(Boolean);
+
+    if (cutouts.length === 0) throw new Error("All element cutouts failed");
+    console.log(`✂️  ${cutouts.length}/${elements.length} cutouts ready`);
+
+    // STEP 4 — Render MP4
+    const mp4Buffer = await renderReanimationVideo(
+      baseImageBuffer,
+      cutouts,
+      canvasW,
+      canvasH,
+    );
+    console.log(`🎥 Rendered ${(mp4Buffer.length / 1024 / 1024).toFixed(2)}MB MP4 in ${((Date.now() - startedAt) / 1000).toFixed(1)}s`);
+
+    // STEP 5 — Upload + persist
+    const cloudResult = await uploadReanimationToCloudinary(mp4Buffer, upload.publicId);
+
+    upload.markModified("reanimations");
+    upload.reanimations.set(REANIM_CACHE_KEY, {
+      status: "completed",
+      videoUrl: cloudResult.videoUrl,
+      publicId: cloudResult.publicId,
+      durationSec: REANIM_DURATION_S,
+      width: cloudResult.width,
+      height: cloudResult.height,
+      elements: cutouts.map((c) => ({ label: c.element.label, type: c.element.type, effect: c.element.effect })),
+      createdAt: new Date(),
+    });
+    await upload.save();
+
+    io.to("reviewers").emit("reanimate-complete", { uploadId, reanimation: upload.reanimations.get(REANIM_CACHE_KEY) });
+    console.log(`✅ REANIMATE DONE — upload ${uploadId} → ${cloudResult.videoUrl}`);
+  } catch (err) {
+    console.error(`❌ REANIMATE FAILED — upload ${uploadId}:`, err.message);
+    try {
+      const upload = await Upload.findById(uploadId);
+      if (upload) {
+        upload.markModified("reanimations");
+        upload.reanimations.set(REANIM_CACHE_KEY, {
+          status: "failed",
+          error: err.message.slice(0, 300),
+          createdAt: new Date(),
+        });
+        await upload.save();
+      }
+    } catch { /* ignore secondary failure */ }
+  } finally {
+    reanimRunningSet.delete(uploadId);
+  }
+}
+
+// ── Reanimate endpoints ───────────────────────────────────────────────────────
+
+// POST /api/uploads/:id/reanimate
+// Kicks off the async reanimation job. Returns cached result when present.
+app.post('/api/uploads/:id/reanimate', auth, async (req, res) => {
+  try {
+    const upload = await Upload.findOne({ _id: req.params.id, userId: req.user.userId });
+    if (!upload) return res.status(404).json({ error: 'Upload not found' });
+
+    if (upload.resourceType === 'video') {
+      return res.status(400).json({ error: 'Reanimate currently supports images only' });
+    }
+
+    const existing = upload.reanimations?.get(REANIM_CACHE_KEY);
+    if (existing?.status === 'completed' && existing.videoUrl) {
+      return res.json({ success: true, cached: true, status: 'completed', reanimation: existing });
+    }
+
+    if (reanimRunningSet.has(upload._id.toString())) {
+      return res.status(202).json({ success: true, cached: false, status: 'processing' });
+    }
+
+    upload.markModified("reanimations");
+    upload.reanimations.set(REANIM_CACHE_KEY, { status: 'processing', createdAt: new Date() });
+    await upload.save();
+
+    // Fire-and-forget — client polls GET /api/uploads/:id for completion
+    runReanimationJob(upload._id.toString());
+
+    res.status(202).json({ success: true, cached: false, status: 'processing' });
+  } catch (err) {
+    console.error('Reanimate request error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+
 
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => console.log(`Server running on port ${PORT}`));
