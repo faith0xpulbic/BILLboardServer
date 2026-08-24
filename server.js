@@ -1491,25 +1491,29 @@ Fill the canvas edge-to-edge with no borders.${correctionNote ? `\n\n${correctio
     const orientationWord = targetWidth > targetHeight ? "WIDE LANDSCAPE" : "TALL PORTRAIT";
     const canvasPrompt =
       mode === "with_original"
-        ? `${DEFAULT_SYSTEM_PROMPT}
+        ? `You are an expert billboard creative adapter performing precise image restoration. High-fidelity, print-ready output.
 
-Image 1 is this advertisement mechanically stretched to ${referenceCanvas.width}x${referenceCanvas.height}px to fit a ${orientationWord} billboard format.
-Image 2 is the untouched original with TRUE proportions.
+TASK: aspect-ratio CORRECTION of an existing advertisement. This is NOT a redesign — utmost resemblance is required.
 
-Redesign Image 1's composition so it looks completely natural at its exact current aspect ratio:
-- Use Image 2 as the proportion reference — restore natural, undistorted shapes for every product, object and piece of typography
-- Reflow and rebalance text across the full width; extend or rebuild the background seamlessly edge-to-edge
-- Preserve brand identity, colours, message hierarchy and every element of the design
+Image 1 is the advertisement, mechanically stretched to ${referenceCanvas.width}x${referenceCanvas.height}px for a ${orientationWord} billboard.
+Image 2 is the untouched ORIGINAL — the single source of truth for how every element must look.
+
+Restore Image 1 so it looks natural at its current aspect ratio, while reproducing every element EXACTLY as it appears in Image 2:
+- Identical text wording, identical fonts, identical colours, identical logo artwork, identical product/house image, identical layout order (logo, headline, tagline, footer contact bar, social handles)
+- The ONLY permitted changes: (1) undo the mechanical stretch so shapes have natural proportions, and (2) extend or rebuild the background where needed to fill the frame
+- Do NOT reinterpret, restyle, recolour, modernise, add, remove or omit ANY element. If in doubt, copy Image 2 exactly.
 
 Output MUST be exactly ${referenceCanvas.width}x${referenceCanvas.height}px — the same shape as Image 1.${correctionNote ? `\n\n${correctionNote}` : ""}`
-        : `${DEFAULT_SYSTEM_PROMPT}
+        : `You are an expert billboard creative adapter performing precise image restoration. High-fidelity, print-ready output.
 
-This advertisement was mechanically stretched to ${referenceCanvas.width}x${referenceCanvas.height}px to fit a ${orientationWord} billboard format.
+TASK: aspect-ratio CORRECTION of an existing advertisement. This is NOT a redesign — utmost resemblance is required.
 
-Redesign the composition so it looks completely natural at its exact current aspect ratio:
-- Counteract the stretch — restore natural, undistorted shapes for every product, object and piece of typography
-- Reflow and rebalance text across the full width; extend or rebuild the background seamlessly edge-to-edge
-- Preserve brand identity, colours, message hierarchy and every element of the design
+This image is the advertisement, mechanically stretched to ${referenceCanvas.width}x${referenceCanvas.height}px for a ${orientationWord} billboard.
+
+Restore it so it looks natural at its current aspect ratio, while keeping every element EXACTLY as shown:
+- Identical text wording, identical fonts, identical colours, identical logo artwork, identical product image, identical layout
+- The ONLY permitted changes: (1) undo the mechanical stretch so shapes have natural proportions, and (2) extend or rebuild the background where needed to fill the frame
+- Do NOT reinterpret, restyle, recolour, modernise, add, remove or omit ANY element.
 
 Output MUST remain exactly ${referenceCanvas.width}x${referenceCanvas.height}px — the same aspect ratio as the input image.${correctionNote ? `\n\n${correctionNote}` : ""}`;
 
@@ -1591,12 +1595,16 @@ Output MUST remain exactly ${referenceCanvas.width}x${referenceCanvas.height}px 
     if (!geminiDims || Math.abs((geminiDims.width / geminiDims.height) - targetAR) / targetAR <= 0.12) break;
   }
 
-  // Upload the RAW Gemini output for inspection/debugging
-  try {
-    const debugUpload = await uploadRefitToCloudinary(generatedBase64, generatedMime, `gemraw_${Date.now()}`);
-    console.log(`🔍 RAW Gemini output (inspect): ${debugUpload.cloudinaryUrl}`);
-  } catch (dbgErr) {
-    console.warn('⚠️ Raw-output debug upload failed:', dbgErr.message);
+  // Upload the RAW Gemini output for inspection/debugging.
+  // Opt-out with env GEMINI_RAW_DEBUG=off — otherwise a gemraw_ copy is kept
+  // in the Cloudinary "refits" folder alongside each refit for inspection.
+  if (process.env.GEMINI_RAW_DEBUG !== "off") {
+    try {
+      const debugUpload = await uploadRefitToCloudinary(generatedBase64, generatedMime, `gemraw_${Date.now()}`);
+      console.log(`🔍 RAW Gemini output (inspect): ${debugUpload.cloudinaryUrl}`);
+    } catch (dbgErr) {
+      console.warn('⚠️ Raw-output debug upload failed:', dbgErr.message);
+    }
   }
 
   // ── STEP 5: Refix to exact dimensions ─────────────────────────────────────
