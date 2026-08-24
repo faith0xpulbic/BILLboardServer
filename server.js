@@ -1438,11 +1438,34 @@ async function generateRefitWithGemini(imageUrl, targetWidth, targetHeight) {
   console.log("Generation path:", ratioCheck.withinTolerance ? "NATIVE (4K + imageConfig)" : "CANVAS FALLBACK");
   console.log("PNG refix:", ratioCheck.exactMatch ? "SKIP (exact match)" : "WILL RUN");
 
-  // ── STEP 2: Build request body builder (supports corrective retry) ────────
+  // ── STEP 2: Canvas-fallback payload builder ────────────────────────────────
+  // Strategy (validated against gemini-3-pro-image behaviour — the model
+  // anchors output shape to the photographic input and ignores blank-canvas
+  // hints):
+  //   attempt 1 → [stretched-to-target original, pristine original] — stretched
+  //               sets output geometry, pristine gives true proportions
+  //   attempt 2 → [stretched] alone — purest geometry signal if attempt 1
+  //               came back the wrong shape
   let referenceCanvas = null;
-  let blankBase64 = null;
+  let stretchedPart = null;
 
-  const buildRequestBody = (correctionNote) => {
+  const getStretchedPart = async () => {
+    referenceCanvas = referenceCanvas || getReferenceCanvasDimensions(targetWidth, targetHeight);
+    if (!stretchedPart) {
+      const buf = await sharp(Buffer.from(imageBase64, "base64"))
+        .resize(referenceCanvas.width, referenceCanvas.height, {
+          fit: "fill",
+          kernel: sharp.kernel.lanczos3,
+        })
+        .jpeg({ quality: 92 })
+        .toBuffer();
+      stretchedPart = { inlineData: { mimeType: "image/jpeg", data: buf.toString("base64") } };
+      console.log(`📐 Pre-stretched source to ${referenceCanvas.width}x${referenceCanvas.height} (${simplifyAspectRatio(referenceCanvas.width, referenceCanvas.height)})`);
+    }
+    return stretchedPart;
+  };
+
+  const buildRequestBody = async (mode, correctionNote) => {
     if (ratioCheck.withinTolerance) {
       const finalPrompt = `${NATIVE_PATH_SYSTEM_PROMPT}
 
@@ -1464,20 +1487,39 @@ Fill the canvas edge-to-edge with no borders.${correctionNote ? `\n\n${correctio
       };
     }
 
-    referenceCanvas = referenceCanvas || getReferenceCanvasDimensions(targetWidth, targetHeight);
-    blankBase64 = blankBase64 || generateBlankPngBase64(referenceCanvas.width, referenceCanvas.height);
+    const stretched = await getStretchedPart();
+    const orientationWord = targetWidth > targetHeight ? "WIDE LANDSCAPE" : "TALL PORTRAIT";
+    const canvasPrompt =
+      mode === "with_original"
+        ? `${DEFAULT_SYSTEM_PROMPT}
 
-    const finalPrompt = `${DEFAULT_SYSTEM_PROMPT}
+Image 1 is this advertisement mechanically stretched to ${referenceCanvas.width}x${referenceCanvas.height}px to fit a ${orientationWord} billboard format.
+Image 2 is the untouched original with TRUE proportions.
 
-Target output size: ${targetWidth}x${targetHeight}px.
-The last image is a blank black reference canvas sized ${referenceCanvas.width}x${referenceCanvas.height}px (${simplifyAspectRatio(referenceCanvas.width, referenceCanvas.height)} — WIDE ${targetWidth > targetHeight ? "LANDSCAPE" : "PORTRAIT"} composition). Use it as the exact composition guide and aspect ratio — your output MUST have this same orientation and shape.${correctionNote ? `\n\n${correctionNote}` : ""}`;
+Redesign Image 1's composition so it looks completely natural at its exact current aspect ratio:
+- Use Image 2 as the proportion reference — restore natural, undistorted shapes for every product, object and piece of typography
+- Reflow and rebalance text across the full width; extend or rebuild the background seamlessly edge-to-edge
+- Preserve brand identity, colours, message hierarchy and every element of the design
+
+Output MUST be exactly ${referenceCanvas.width}x${referenceCanvas.height}px — the same shape as Image 1.${correctionNote ? `\n\n${correctionNote}` : ""}`
+        : `${DEFAULT_SYSTEM_PROMPT}
+
+This advertisement was mechanically stretched to ${referenceCanvas.width}x${referenceCanvas.height}px to fit a ${orientationWord} billboard format.
+
+Redesign the composition so it looks completely natural at its exact current aspect ratio:
+- Counteract the stretch — restore natural, undistorted shapes for every product, object and piece of typography
+- Reflow and rebalance text across the full width; extend or rebuild the background seamlessly edge-to-edge
+- Preserve brand identity, colours, message hierarchy and every element of the design
+
+Output MUST remain exactly ${referenceCanvas.width}x${referenceCanvas.height}px — the same aspect ratio as the input image.${correctionNote ? `\n\n${correctionNote}` : ""}`;
+
+    const parts =
+      mode === "with_original"
+        ? [stretched, { inlineData: { mimeType, data: imageBase64 } }, { text: canvasPrompt }]
+        : [stretched, { text: canvasPrompt }];
 
     return {
-      contents: [{ role: "user", parts: [
-        { inlineData: { mimeType, data: imageBase64 } },
-        { inlineData: { mimeType: "image/png", data: blankBase64 } },
-        { text: finalPrompt },
-      ]}],
+      contents: [{ role: "user", parts }],
       generationConfig: {
         responseModalities: ["IMAGE"],
       },
@@ -1496,13 +1538,19 @@ The last image is a blank black reference canvas sized ${referenceCanvas.width}x
   let geminiDims = null;
 
   for (let attempt = 0; attempt < 2; attempt += 1) {
+    // Attempt ladder: canvas path tries [stretched+original] first, then
+    // [stretched] alone if the shape came back wrong.
+    const mode = ratioCheck.withinTolerance
+      ? "native"
+      : attempt === 0 ? "with_original" : "stretched_only";
+
     let correctionNote = null;
     if (attempt > 0 && geminiDims) {
       correctionNote = `CRITICAL CORRECTION: Your previous output was ${geminiDims.width}x${geminiDims.height}px which is the WRONG orientation/aspect ratio. The required composition is ${referenceCanvas ? `${referenceCanvas.width}x${referenceCanvas.height}` : `${targetWidth}x${targetHeight}`}px (${targetWidth > targetHeight ? "WIDE LANDSCAPE" : "TALL PORTRAIT"}). Regenerate the full design at the correct aspect ratio.`;
-      console.log(`⚠️ Gemini output AR mismatch (${geminiDims.width}x${geminiDims.height}) — retrying with correction`);
+      console.log(`⚠️ Gemini output AR mismatch (${geminiDims.width}x${geminiDims.height}) — retrying (mode: ${mode})`);
     }
 
-    const requestBody = buildRequestBody(correctionNote);
+    const requestBody = await buildRequestBody(mode, correctionNote);
     const geminiStart = Date.now();
 
     const response = await fetch(
