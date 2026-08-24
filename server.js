@@ -1380,34 +1380,16 @@ function checkAspectRatioTolerance(targetWidth, targetHeight, tolerancePct = 5) 
 
 const sharp = require('sharp');
 
-async function scaleToFitAspectRatio(srcBase64, targetWidth, targetHeight) {
-  const inputBuffer = Buffer.from(srcBase64, 'base64');
-  const sharpStart = Date.now();
-
-  const outputBuffer = await sharp(inputBuffer)
-    .resize(targetWidth, targetHeight, {
-      fit: 'fill',        // ← squeezes/stretches to exact dimensions, no cropping
-      kernel: sharp.kernel.lanczos3
-    })
-    .png({
-      compressionLevel:3,
-      effort: 3,
-    })
-    .toBuffer();
-
-  const sharpEnd = Date.now();
-  console.log(`🔧 Sharp squeeze-to-fit — ${targetWidth}x${targetHeight} | ${sharpEnd - sharpStart}ms`);
-
-  return outputBuffer.toString('base64');
-}
-
+// (scaleToFitAspectRatio is defined once, below generateRefitWithGemini —
+//  a previous duplicate here shadowed it and is removed.)
 
 // ── Cloudinary upload helper ───────────────────────────────────────────────────
 
 async function uploadRefitToCloudinary(imageBase64, mimeType, publicIdPrefix) {
   const { v4: uuidv4 } = require('uuid');
   const fs = require('fs');
-  const tempPath = `uploads/refit_${uuidv4()}.png`;
+  const ext = mimeType.includes('jpeg') ? 'jpg' : mimeType.includes('webp') ? 'webp' : 'png';
+  const tempPath = `uploads/refit_${uuidv4()}.${ext}`;
 
   fs.writeFileSync(tempPath, Buffer.from(imageBase64, 'base64'));
 
@@ -1456,39 +1438,41 @@ async function generateRefitWithGemini(imageUrl, targetWidth, targetHeight) {
   console.log("Generation path:", ratioCheck.withinTolerance ? "NATIVE (4K + imageConfig)" : "CANVAS FALLBACK");
   console.log("PNG refix:", ratioCheck.exactMatch ? "SKIP (exact match)" : "WILL RUN");
 
-  // ── STEP 2: Build request body ────────────────────────────────────────────
-  let requestBody;
+  // ── STEP 2: Build request body builder (supports corrective retry) ────────
+  let referenceCanvas = null;
+  let blankBase64 = null;
 
-  if (ratioCheck.withinTolerance) {
-    const finalPrompt = `${NATIVE_PATH_SYSTEM_PROMPT}
+  const buildRequestBody = (correctionNote) => {
+    if (ratioCheck.withinTolerance) {
+      const finalPrompt = `${NATIVE_PATH_SYSTEM_PROMPT}
 
 Target output size: ${targetWidth}x${targetHeight}px (${ratioCheck.bestSupportedRatio}).
-Fill the canvas edge-to-edge with no borders.`;
+Fill the canvas edge-to-edge with no borders.${correctionNote ? `\n\n${correctionNote}` : ""}`;
 
-    requestBody = {
-      contents: [{ role: "user", parts: [
-        { inlineData: { mimeType, data: imageBase64 } },
-        { text: finalPrompt },
-      ]}],
-      generationConfig: {
-        responseModalities: ["IMAGE"],
-        imageConfig: {
-          aspectRatio: ratioCheck.bestSupportedRatio,
-          imageSize: "2k",
+      return {
+        contents: [{ role: "user", parts: [
+          { inlineData: { mimeType, data: imageBase64 } },
+          { text: finalPrompt },
+        ]}],
+        generationConfig: {
+          responseModalities: ["IMAGE"],
+          imageConfig: {
+            aspectRatio: ratioCheck.bestSupportedRatio,
+            imageSize: "2k",
+          },
         },
-      },
-    };
+      };
+    }
 
-  } else {
-    const referenceCanvas = getReferenceCanvasDimensions(targetWidth, targetHeight);
-    const blankBase64 = generateBlankPngBase64(referenceCanvas.width, referenceCanvas.height);
+    referenceCanvas = referenceCanvas || getReferenceCanvasDimensions(targetWidth, targetHeight);
+    blankBase64 = blankBase64 || generateBlankPngBase64(referenceCanvas.width, referenceCanvas.height);
 
     const finalPrompt = `${DEFAULT_SYSTEM_PROMPT}
 
 Target output size: ${targetWidth}x${targetHeight}px.
-The last image is a blank black reference canvas sized ${referenceCanvas.width}x${referenceCanvas.height}px. Use it as the exact composition guide and aspect ratio.`;
+The last image is a blank black reference canvas sized ${referenceCanvas.width}x${referenceCanvas.height}px (${simplifyAspectRatio(referenceCanvas.width, referenceCanvas.height)} — WIDE ${targetWidth > targetHeight ? "LANDSCAPE" : "PORTRAIT"} composition). Use it as the exact composition guide and aspect ratio — your output MUST have this same orientation and shape.${correctionNote ? `\n\n${correctionNote}` : ""}`;
 
-    requestBody = {
+    return {
       contents: [{ role: "user", parts: [
         { inlineData: { mimeType, data: imageBase64 } },
         { inlineData: { mimeType: "image/png", data: blankBase64 } },
@@ -1498,78 +1482,92 @@ The last image is a blank black reference canvas sized ${referenceCanvas.width}x
         responseModalities: ["IMAGE"],
       },
     };
-  }
+  };
 
-  // ── STEP 3: Call Gemini ───────────────────────────────────────────────────
+  // ── STEP 3+4: Call Gemini, validate output aspect ratio, retry once ───────
   const projectId = "project-b275f288-bac3-429e-877";
   const region = "global";
   // gemini-3-pro-image-preview was shut down 2026-06-25 → use GA model
   const model = "gemini-3-pro-image";
-  const geminiStart = Date.now();
+  const targetAR = targetWidth / targetHeight;
 
-  const response = await fetch(
-    `https://aiplatform.googleapis.com/v1/projects/${projectId}/locations/${region}/publishers/google/models/${model}:generateContent?key=${apiKey}`,
-    {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(requestBody),
-    }
-  );
-
-  const geminiEnd = Date.now();
-
-  if (!response.ok) {
-    const errorText = await response.text();
-    throw new Error(`Gemini API error (${response.status}): ${errorText}`);
-  }
-
-  const result = await response.json();
-  if (!result.candidates?.[0]?.content?.parts) throw new Error("No content in Gemini response");
-
-  // ── STEP 4: Extract generated image ──────────────────────────────────────
   let generatedBase64 = null;
   let generatedMime = 'image/png';
+  let geminiDims = null;
 
-  for (const part of result.candidates[0].content.parts) {
-    if (part.inlineData) {
-      generatedBase64 = part.inlineData.data;
-      generatedMime = part.inlineData.mimeType || 'image/png';
-      break;
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    let correctionNote = null;
+    if (attempt > 0 && geminiDims) {
+      correctionNote = `CRITICAL CORRECTION: Your previous output was ${geminiDims.width}x${geminiDims.height}px which is the WRONG orientation/aspect ratio. The required composition is ${referenceCanvas ? `${referenceCanvas.width}x${referenceCanvas.height}` : `${targetWidth}x${targetHeight}`}px (${targetWidth > targetHeight ? "WIDE LANDSCAPE" : "TALL PORTRAIT"}). Regenerate the full design at the correct aspect ratio.`;
+      console.log(`⚠️ Gemini output AR mismatch (${geminiDims.width}x${geminiDims.height}) — retrying with correction`);
     }
+
+    const requestBody = buildRequestBody(correctionNote);
+    const geminiStart = Date.now();
+
+    const response = await fetch(
+      `https://aiplatform.googleapis.com/v1/projects/${projectId}/locations/${region}/publishers/google/models/${model}:generateContent?key=${apiKey}`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(requestBody),
+      }
+    );
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      throw new Error(`Gemini API error (${response.status}): ${errorText}`);
+    }
+
+    const result = await response.json();
+    if (!result.candidates?.[0]?.content?.parts) throw new Error("No content in Gemini response");
+
+    generatedBase64 = null;
+    for (const part of result.candidates[0].content.parts) {
+      if (part.inlineData) {
+        generatedBase64 = part.inlineData.data;
+        generatedMime = part.inlineData.mimeType || 'image/png';
+        break;
+      }
+    }
+    if (!generatedBase64) throw new Error('No image generated by Gemini');
+
+    geminiDims = getImageDimensionsFromBase64(generatedBase64);
+    const geminiSizeBytes = Buffer.from(generatedBase64, 'base64').length;
+    const arErrorPct = geminiDims
+      ? (Math.abs((geminiDims.width / geminiDims.height) - targetAR) / targetAR * 100).toFixed(1)
+      : '?';
+    console.log(`📊 Gemini raw output (attempt ${attempt + 1}) — ${geminiDims?.width || '?'}x${geminiDims?.height || '?'} | AR error vs target: ${arErrorPct}% | ${(geminiSizeBytes/1024).toFixed(1)}KB | ${Date.now() - geminiStart}ms`);
+
+    // Accept when output ratio is within 12% of the target ratio
+    if (!geminiDims || Math.abs((geminiDims.width / geminiDims.height) - targetAR) / targetAR <= 0.12) break;
   }
 
-  if (!generatedBase64) throw new Error('No image generated by Gemini');
+  // Upload the RAW Gemini output for inspection/debugging
+  try {
+    const debugUpload = await uploadRefitToCloudinary(generatedBase64, generatedMime, `gemraw_${Date.now()}`);
+    console.log(`🔍 RAW Gemini output (inspect): ${debugUpload.cloudinaryUrl}`);
+  } catch (dbgErr) {
+    console.warn('⚠️ Raw-output debug upload failed:', dbgErr.message);
+  }
 
-  // NEW: Log raw Gemini output dimensions & size BEFORE png refix
-  const geminiDims = getImageDimensionsFromBase64(generatedBase64);
-  const geminiSizeBytes = Buffer.from(generatedBase64, 'base64').length;
-  console.log(`📊 Gemini raw output — ${geminiDims?.width || '?'}x${geminiDims?.height || '?'} | ${(geminiSizeBytes/1024).toFixed(1)}KB | ${geminiEnd - geminiStart}ms`);
-
-  // ── STEP 5: PNG refix ─────────────────────────────────────────────────────
-    // Exact native match → Gemini already output correct ratio, skip refix.
-  // Approximated native (within 5%) → refix to exact target dims.
-  // Canvas method (>5%) → refix to exact target dims.
+  // ── STEP 5: Refix to exact dimensions ─────────────────────────────────────
+  // Exact native match → skip. Otherwise lock in the exact target dims.
+  // Works on ANY output format now (sharp reads png/jpeg/webp alike).
 
   let finalBase64 = generatedBase64;
+  let finalMime = generatedMime;
   const needsRefix = !ratioCheck.exactMatch;
 
   if (needsRefix) {
     const reason = !ratioCheck.withinTolerance ? 'canvas method' : 'approximated native ratio';
-    console.log(`🖼  Running PNG refix (reason: ${reason})...`);
+    console.log(`🖼  Running refix (reason: ${reason})...`);
+    finalBase64 = await scaleToFitAspectRatio(generatedBase64, targetWidth, targetHeight);
+    finalMime = 'image/jpeg';
 
-    const refixStart = Date.now();
-
-    if (generatedMime.includes('png')) {
-      finalBase64 = await scaleToFitAspectRatio(generatedBase64, targetWidth, targetHeight);
-      const refixEnd = Date.now();
-
-      // NEW: Log final dimensions & size AFTER sharp processing
-      const finalDims = getImageDimensionsFromBase64(finalBase64);
-      const finalSizeBytes = Buffer.from(finalBase64, 'base64').length;
-      console.log(`✅ PNG refix complete — ${finalDims?.width || '?'}x${finalDims?.height || '?'} | ${(finalSizeBytes/1024).toFixed(1)}KB | ${refixEnd - refixStart}ms`);
-    } else {
-      console.warn('⚠️  Non-PNG output from Gemini — skipping refix');
-    }
+    const finalDims = getImageDimensionsFromBase64(finalBase64);
+    const finalSizeBytes = Buffer.from(finalBase64, 'base64').length;
+    console.log(`✅ Refix complete — ${finalDims?.width || '?'}x${finalDims?.height || '?'} | ${(finalSizeBytes/1024).toFixed(1)}KB`);
   } else {
     console.log('✅ Exact native match — no refix needed');
   }
@@ -1579,7 +1577,7 @@ The last image is a blank black reference canvas sized ${referenceCanvas.width}x
 
   return {
     imageBase64: finalBase64,
-    mimeType: 'image/png',
+    mimeType: finalMime,
     aspectRatio: simplifyAspectRatio(targetWidth, targetHeight),
     width: targetWidth,
     height: targetHeight,
@@ -1590,25 +1588,38 @@ The last image is a blank black reference canvas sized ${referenceCanvas.width}x
 
 // ── Sharp resize helper ───────────────────────────────────────────────────────
 
+// Cap the refix resolution — upscaling to full print size in-process took
+// minutes on small CPUs. The stored refit keeps the EXACT aspect ratio at a
+// capped size; delivery-side upscaling (Cloudinary) handles final print size.
+const REFIX_MAX_SIDE = 2048;
+
 async function scaleToFitAspectRatio(srcBase64, targetWidth, targetHeight) {
   const inputBuffer = Buffer.from(srcBase64, 'base64');
   const sharpStart = Date.now();
 
+  let outW; let outH;
+  const longest = Math.max(targetWidth, targetHeight);
+  if (longest > REFIX_MAX_SIDE) {
+    const s = REFIX_MAX_SIDE / longest;
+    outW = Math.max(2, Math.round(targetWidth * s));
+    outH = Math.max(2, Math.round(targetHeight * s));
+  } else {
+    outW = Math.round(targetWidth / 2) * 2;
+    outH = Math.round(targetHeight / 2) * 2;
+  }
+
+  const srcMeta = await sharp(inputBuffer).metadata();
+  console.log(`🔧 Sharp refix — src ${srcMeta.width}x${srcMeta.height} → ${outW}x${outH} (target ${targetWidth}x${targetHeight}, ${simplifyAspectRatio(targetWidth, targetHeight)})`);
+
   const outputBuffer = await sharp(inputBuffer)
-    .resize(targetWidth, targetHeight, {
-      //fit: 'cover',         fills canvas, crops edges to maintain aspect ratio
-      fit: 'fill',      // ← UNCOMMENT THIS INSTEAD IF YOU WANT TO SQUEEZE/STRETCH
-      position: 'centre',
+    .resize(outW, outH, {
+      fit: 'fill',      // squeeze/stretch to the EXACT locked-in ratio
       kernel: sharp.kernel.lanczos3
     })
-    .png({
-      compressionLevel: 6,
-      effort: 7,
-    })
+    .jpeg({ quality: 90 })
     .toBuffer();
 
-  const sharpEnd = Date.now();
-  console.log(`🔧 Sharp resize — ${targetWidth}x${targetHeight} | ${sharpEnd - sharpStart}ms`);
+  console.log(`🔧 Sharp refix done — ${outW}x${outH} | ${Date.now() - sharpStart}ms`);
 
   return outputBuffer.toString('base64');
 }
@@ -1873,7 +1884,7 @@ const REANIM_FPS = 30;
 const REANIM_DURATION_S = 10;      // total video length
 const REANIM_ENTRANCE_S = 2;       // window in which all effects animate + settle
 const REANIM_SLIDE_T1_S = 1.2;     // slide-from-right travel time
-const REANIM_MAX_ELEMENTS = 4;
+const REANIM_MAX_ELEMENTS = 3;
 const REANIM_MAX_SIDE = 1280;      // render canvas cap for speed
 const REANIM_CACHE_KEY = "default";
 
@@ -1993,8 +2004,46 @@ async function detectReanimateElements(imageBase64, mimeType) {
   return cleaned;
 }
 
-// Image-editing model call — returns generated image base64
-async function generateReanimImage(parts) {
+// Image-editing model call — returns generated image base64.
+// Wrapped with a GLOBAL single-slot queue + 429 backoff: Vertex image quotas
+// are per-project-per-minute and shared across ALL users, so concurrent jobs
+// must line up here instead of colliding into RESOURCE_EXHAUSTED errors.
+let geminiImageActive = 0;
+const geminiImageQueue = [];
+
+async function acquireGeminiImageSlot() {
+  if (geminiImageActive < 1) { geminiImageActive += 1; return; }
+  await new Promise((resolve) => geminiImageQueue.push(resolve));
+  geminiImageActive += 1;
+}
+
+function releaseGeminiImageSlot() {
+  geminiImageActive -= 1;
+  const next = geminiImageQueue.shift();
+  if (next) next();
+}
+
+async function generateReanimImage(parts, attempts = 3) {
+  let lastErr;
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    await acquireGeminiImageSlot();
+    try {
+      return await generateReanimImageOnce(parts);
+    } catch (err) {
+      lastErr = err;
+      const isQuota = /429|RESOURCE_EXHAUSTED/i.test(err.message || "");
+      if (!isQuota || attempt === attempts - 1) throw err;
+      const delayMs = 10000 * (attempt + 1);
+      console.warn(`⚠️ Gemini image quota hit — backing off ${delayMs}ms (retry ${attempt + 1}/${attempts - 1})`);
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
+    } finally {
+      releaseGeminiImageSlot();
+    }
+  }
+  throw lastErr;
+}
+
+async function generateReanimImageOnce(parts) {
   const response = await fetch(reanimGeminiUrl(GEMINI_IMAGE_MODEL), {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -2170,10 +2219,11 @@ async function renderReanimationVideo(baseImageBuffer, layers, canvasW, canvasH)
 
   const ffmpegArgs = [
     "-y",
-    "-f", "rawvideo",
-    "-pix_fmt", "rgb24",
-    "-s", `${canvasW}x${canvasH}`,
-    "-r", String(REANIM_FPS),
+    // image2pipe: each frame arrives as a fully-encoded PNG (self-describing
+    // dimensions/format) — eliminates any raw-RGB stride mismatch that can
+    // produce static-like corruption.
+    "-f", "image2pipe",
+    "-framerate", String(REANIM_FPS),
     "-i", "-",
     "-c:v", "libx264",
     "-preset", "medium",
@@ -2291,7 +2341,9 @@ async function renderReanimationVideo(baseImageBuffer, layers, canvasW, canvasH)
           const frameRaw = await sharp(baseImageBuffer)
             .composite(composites)
             .flatten({ background: "#000000" })
-            .raw()
+            // compressionLevel 0 = store-only PNG: fast to encode, decoded
+            // losslessly by ffmpeg from the image2pipe stream
+            .png({ compressionLevel: 0 })
             .toBuffer();
 
           if (!proc.stdin.write(frameRaw)) {
@@ -2443,10 +2495,12 @@ async function runReanimationJob(uploadId, options = {}) {
         .toBuffer();
     }
 
-    // STEP 3 — Cutouts (parallel per element, drop failures)
-    const cutouts = (await Promise.all(
-      elements.map((el) => generateElementCutout(sourceBase64, mimeType, el, canvasW, canvasH)),
-    )).map((cutout, idx) => (cutout ? { element: elements[idx], cutout } : null)).filter(Boolean);
+    // STEP 3 — Cutouts (sequential — respects the shared Gemini image quota)
+    const cutouts = [];
+    for (const el of elements) {
+      const cutout = await generateElementCutout(sourceBase64, mimeType, el, canvasW, canvasH);
+      if (cutout) cutouts.push({ element: el, cutout });
+    }
 
     if (cutouts.length === 0) throw new Error("All element cutouts failed");
     console.log(`✂️  ${cutouts.length}/${elements.length} cutouts ready`);
