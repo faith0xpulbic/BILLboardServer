@@ -168,6 +168,10 @@ const Upload = mongoose.model(
           width: Number,
           height: Number,
           elements: { type: Array, default: undefined },
+          // Aspect ratio key this animation was generated for (e.g. "16:9")
+          aspectRatio: String,
+          // Whether the source creative was the original upload or its refit
+          source: { type: String, enum: ["original", "refit"] },
           error: String,
           createdAt: Date
         },
@@ -1499,7 +1503,8 @@ The last image is a blank black reference canvas sized ${referenceCanvas.width}x
   // ── STEP 3: Call Gemini ───────────────────────────────────────────────────
   const projectId = "project-b275f288-bac3-429e-877";
   const region = "global";
-  const model = "gemini-3-pro-image-preview";
+  // gemini-3-pro-image-preview was shut down 2026-06-25 → use GA model
+  const model = "gemini-3-pro-image";
   const geminiStart = Date.now();
 
   const response = await fetch(
@@ -1857,6 +1862,13 @@ app.post('/api/refit/png-scale-test', uploadMemory.single('image'), async (req, 
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
+// Gemini models — preview variants were shut down 2026-06-25; these are GA.
+// Image editing/generation: gemini-3.1-flash-image (Nano Banana 2).
+// Vision/JSON detection:    gemini-3.7-flash.
+// Refit (print-quality generation): gemini-3-pro-image (Nano Banana Pro).
+const GEMINI_FLASH_MODEL = "gemini-3.7-flash";
+const GEMINI_IMAGE_MODEL = "gemini-3.1-flash-image";
+
 const REANIM_FPS = 30;
 const REANIM_DURATION_S = 10;      // total video length
 const REANIM_ENTRANCE_S = 2;       // window in which all effects animate + settle
@@ -1933,7 +1945,7 @@ async function detectReanimateElements(imageBase64, mimeType) {
     },
   };
 
-  const response = await fetch(reanimGeminiUrl("gemini-2.5-flash"), {
+  const response = await fetch(reanimGeminiUrl(GEMINI_FLASH_MODEL), {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(requestBody),
@@ -1983,7 +1995,7 @@ async function detectReanimateElements(imageBase64, mimeType) {
 
 // Image-editing model call — returns generated image base64
 async function generateReanimImage(parts) {
-  const response = await fetch(reanimGeminiUrl("gemini-3-pro-image-preview"), {
+  const response = await fetch(reanimGeminiUrl(GEMINI_IMAGE_MODEL), {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
@@ -2321,7 +2333,8 @@ async function uploadReanimationToCloudinary(mp4Buffer, publicIdPrefix) {
 
 const reanimRunningSet = new Set(); // uploadIds with a job in flight
 
-async function runReanimationJob(uploadId) {
+async function runReanimationJob(uploadId, options = {}) {
+  const { ratioKey = REANIM_CACHE_KEY, targetWidth = null, targetHeight = null } = options;
   const startedAt = Date.now();
   reanimRunningSet.add(uploadId);
 
@@ -2329,18 +2342,69 @@ async function runReanimationJob(uploadId) {
     const upload = await Upload.findById(uploadId);
     if (!upload) return;
 
-    console.log(`\n🎬 REANIMATE START — upload ${uploadId}`);
+    console.log(`\n🎬 REANIMATE START — upload ${uploadId} (ratio: ${ratioKey})`);
 
-    // Canvas geometry
-    const srcW = upload.dimensions?.width || 1080;
-    const srcH = upload.dimensions?.height || 1080;
+    // ── STEP 0 — Source selection: original vs refit ────────────────────────
+    // If the upload doesn't match the billboard's target aspect ratio, animate
+    // the refit version instead. Reuse the cached refit if present; otherwise
+    // generate one via the existing refit pipeline and persist it in
+    // upload.refits so it is documented and never regenerated.
+    let sourceUrl = upload.cloudinaryUrl;
+    let sourceKind = "original";
+
+    const tw = parseInt(targetWidth);
+    const th = parseInt(targetHeight);
+    const hasTarget = Number.isFinite(tw) && Number.isFinite(th) && tw > 0 && th > 0;
+
+    if (
+      hasTarget &&
+      upload.dimensions?.width &&
+      upload.dimensions?.height
+    ) {
+      const srcAR = upload.dimensions.width / upload.dimensions.height;
+      const tgtAR = tw / th;
+      const mismatched = Math.abs(srcAR - tgtAR) > 0.05 * tgtAR;
+
+      if (mismatched) {
+        const existingRefit = upload.refits?.get(ratioKey);
+        if (existingRefit?.cloudinaryUrl) {
+          sourceUrl = existingRefit.cloudinaryUrl;
+          sourceKind = "refit";
+          console.log(`📐 Aspect mismatch — using cached refit for ${ratioKey}`);
+        } else {
+          console.log(`📐 Aspect mismatch — generating refit for ${ratioKey} first`);
+          const refitResult = await generateRefitWithGemini(upload.cloudinaryUrl, tw, th);
+          const cloudRefit = await uploadRefitToCloudinary(
+            refitResult.imageBase64,
+            refitResult.mimeType,
+            upload.publicId
+          );
+          upload.markModified("refits");
+          upload.refits.set(ratioKey, {
+            cloudinaryUrl: cloudRefit.cloudinaryUrl,
+            publicId: cloudRefit.publicId,
+            dimensions: cloudRefit.dimensions,
+            createdAt: new Date()
+          });
+          await upload.save();
+          sourceUrl = cloudRefit.cloudinaryUrl;
+          sourceKind = "refit";
+          console.log(`✅ Refit generated and cached under ${ratioKey}`);
+        }
+      }
+    }
+
+    // ── Canvas geometry from the ACTUAL source image ─────────────────────────
+    const sourceBuffer = await fetchImageAsBuffer(sourceUrl);
+    const sourceMeta = await sharp(sourceBuffer).metadata();
+    const mimeType = sourceMeta.format === "png" ? "image/png" : "image/jpeg";
+    const sourceBase64 = sourceBuffer.toString("base64");
+
+    const srcW = sourceMeta.width || upload.dimensions?.width || 1080;
+    const srcH = sourceMeta.height || upload.dimensions?.height || 1080;
     const scaleDown = Math.min(1, REANIM_MAX_SIDE / Math.max(srcW, srcH));
     const canvasW = Math.max(2, Math.round((srcW * scaleDown) / 2) * 2);
     const canvasH = Math.max(2, Math.round((srcH * scaleDown) / 2) * 2);
-
-    const sourceBuffer = await fetchImageAsBuffer(upload.cloudinaryUrl);
-    const mimeType = upload.format === "png" ? "image/png" : "image/jpeg";
-    const sourceBase64 = sourceBuffer.toString("base64");
 
     // STEP 1 — Detect elements
     const elements = await detectReanimateElements(sourceBase64, mimeType);
@@ -2400,7 +2464,7 @@ async function runReanimationJob(uploadId) {
     const cloudResult = await uploadReanimationToCloudinary(mp4Buffer, upload.publicId);
 
     upload.markModified("reanimations");
-    upload.reanimations.set(REANIM_CACHE_KEY, {
+    upload.reanimations.set(ratioKey, {
       status: "completed",
       videoUrl: cloudResult.videoUrl,
       publicId: cloudResult.publicId,
@@ -2408,11 +2472,13 @@ async function runReanimationJob(uploadId) {
       width: cloudResult.width,
       height: cloudResult.height,
       elements: cutouts.map((c) => ({ label: c.element.label, type: c.element.type, effect: c.element.effect })),
+      aspectRatio: ratioKey === REANIM_CACHE_KEY ? null : ratioKey,
+      source: sourceKind,
       createdAt: new Date(),
     });
     await upload.save();
 
-    io.to("reviewers").emit("reanimate-complete", { uploadId, reanimation: upload.reanimations.get(REANIM_CACHE_KEY) });
+    io.to("reviewers").emit("reanimate-complete", { uploadId, reanimation: upload.reanimations.get(ratioKey) });
     console.log(`✅ REANIMATE DONE — upload ${uploadId} → ${cloudResult.videoUrl}`);
   } catch (err) {
     console.error(`❌ REANIMATE FAILED — upload ${uploadId}:`, err.message);
@@ -2420,9 +2486,10 @@ async function runReanimationJob(uploadId) {
       const upload = await Upload.findById(uploadId);
       if (upload) {
         upload.markModified("reanimations");
-        upload.reanimations.set(REANIM_CACHE_KEY, {
+        upload.reanimations.set(ratioKey, {
           status: "failed",
           error: err.message.slice(0, 300),
+          aspectRatio: ratioKey === REANIM_CACHE_KEY ? null : ratioKey,
           createdAt: new Date(),
         });
         await upload.save();
@@ -2436,7 +2503,11 @@ async function runReanimationJob(uploadId) {
 // ── Reanimate endpoints ───────────────────────────────────────────────────────
 
 // POST /api/uploads/:id/reanimate
-// Kicks off the async reanimation job. Returns cached result when present.
+// Body (optional): { targetWidth, targetHeight } — the billboard's pixel dims.
+//   When provided and the upload doesn't match that aspect ratio, the refit
+//   version is used as the animation source (generated + cached if missing),
+//   and the result is cached under that aspect-ratio key so it is never
+//   regenerated for the same placement.
 app.post('/api/uploads/:id/reanimate', auth, async (req, res) => {
   try {
     const upload = await Upload.findOne({ _id: req.params.id, userId: req.user.userId });
@@ -2446,23 +2517,32 @@ app.post('/api/uploads/:id/reanimate', auth, async (req, res) => {
       return res.status(400).json({ error: 'Reanimate currently supports images only' });
     }
 
-    const existing = upload.reanimations?.get(REANIM_CACHE_KEY);
+    const tw = parseInt(req.body?.targetWidth);
+    const th = parseInt(req.body?.targetHeight);
+    const hasTarget = Number.isFinite(tw) && Number.isFinite(th) && tw > 0 && th > 0;
+    const ratioKey = hasTarget ? simplifyAspectRatio(tw, th) : REANIM_CACHE_KEY;
+
+    const existing = upload.reanimations?.get(ratioKey);
     if (existing?.status === 'completed' && existing.videoUrl) {
-      return res.json({ success: true, cached: true, status: 'completed', reanimation: existing });
+      return res.json({ success: true, cached: true, status: 'completed', key: ratioKey, reanimation: existing });
     }
 
     if (reanimRunningSet.has(upload._id.toString())) {
-      return res.status(202).json({ success: true, cached: false, status: 'processing' });
+      return res.status(202).json({ success: true, cached: false, status: 'processing', key: ratioKey });
     }
 
     upload.markModified("reanimations");
-    upload.reanimations.set(REANIM_CACHE_KEY, { status: 'processing', createdAt: new Date() });
+    upload.reanimations.set(ratioKey, {
+      status: 'processing',
+      aspectRatio: hasTarget ? ratioKey : null,
+      createdAt: new Date()
+    });
     await upload.save();
 
     // Fire-and-forget — client polls GET /api/uploads/:id for completion
-    runReanimationJob(upload._id.toString());
+    runReanimationJob(upload._id.toString(), hasTarget ? { ratioKey, targetWidth: tw, targetHeight: th } : {});
 
-    res.status(202).json({ success: true, cached: false, status: 'processing' });
+    res.status(202).json({ success: true, cached: false, status: 'processing', key: ratioKey });
   } catch (err) {
     console.error('Reanimate request error:', err);
     res.status(500).json({ error: err.message });
