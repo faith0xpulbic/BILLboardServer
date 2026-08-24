@@ -1439,33 +1439,33 @@ async function generateRefitWithGemini(imageUrl, targetWidth, targetHeight) {
   console.log("PNG refix:", ratioCheck.exactMatch ? "SKIP (exact match)" : "WILL RUN");
 
   // ── STEP 2: Canvas-fallback payload builder ────────────────────────────────
-  // Strategy (validated against gemini-3-pro-image behaviour — the model
-  // anchors output shape to the photographic input and ignores blank-canvas
-  // hints):
-  //   attempt 1 → [stretched-to-target original, pristine original] — stretched
-  //               sets output geometry, pristine gives true proportions
-  //   attempt 2 → [stretched] alone — purest geometry signal if attempt 1
-  //               came back the wrong shape
+  // Strategy — outpainting: the ORIGINAL is centered on a black canvas of the
+  // target shape (fit: contain → fills height on landscape targets, width on
+  // portrait targets). Zero distortion: every original pixel is intact. The
+  // prompt asks the model to recompose the design outward into the black bars.
+  // No aspect-ratio numbers are mentioned to the model.
   let referenceCanvas = null;
-  let stretchedPart = null;
+  let paddedPart = null;
 
-  const getStretchedPart = async () => {
+  const getPaddedPart = async () => {
     referenceCanvas = referenceCanvas || getReferenceCanvasDimensions(targetWidth, targetHeight);
-    if (!stretchedPart) {
+    if (!paddedPart) {
       const buf = await sharp(Buffer.from(imageBase64, "base64"))
         .resize(referenceCanvas.width, referenceCanvas.height, {
-          fit: "fill",
+          fit: "contain",
+          background: "#000000",
           kernel: sharp.kernel.lanczos3,
         })
         .jpeg({ quality: 92 })
         .toBuffer();
-      stretchedPart = { inlineData: { mimeType: "image/jpeg", data: buf.toString("base64") } };
-      console.log(`📐 Pre-stretched source to ${referenceCanvas.width}x${referenceCanvas.height} (${simplifyAspectRatio(referenceCanvas.width, referenceCanvas.height)})`);
+      paddedPart = { inlineData: { mimeType: "image/jpeg", data: buf.toString("base64") } };
+      const barsSide = targetWidth > targetHeight ? "left/right" : "top/bottom";
+      console.log(`🖼  Original centered on black canvas ${referenceCanvas.width}x${referenceCanvas.height} (bars: ${barsSide})`);
     }
-    return stretchedPart;
+    return paddedPart;
   };
 
-  const buildRequestBody = async (mode, correctionNote) => {
+  const buildRequestBody = async (correctionNote) => {
     if (ratioCheck.withinTolerance) {
       const finalPrompt = `${NATIVE_PATH_SYSTEM_PROMPT}
 
@@ -1487,43 +1487,44 @@ Fill the canvas edge-to-edge with no borders.${correctionNote ? `\n\n${correctio
       };
     }
 
-    const stretched = await getStretchedPart();
-    const orientationWord = targetWidth > targetHeight ? "WIDE LANDSCAPE" : "TALL PORTRAIT";
-    const canvasPrompt =
-      mode === "with_original"
-        ? `You are an expert billboard creative adapter performing precise image restoration. High-fidelity, print-ready output.
+    const padded = await getPaddedPart();
 
-TASK: aspect-ratio CORRECTION of an existing advertisement. This is NOT a redesign — utmost resemblance is required.
+    const barsDesc = targetWidth > targetHeight
+      ? "left and right sides"
+      : "top and bottom";
+    const targetRatioStr = simplifyAspectRatio(referenceCanvas.width, referenceCanvas.height);
+    const orientationWord = targetWidth > targetHeight ? "horizontal" : "vertical";
 
-Image 1 is the advertisement, mechanically stretched to ${referenceCanvas.width}x${referenceCanvas.height}px for a ${orientationWord} billboard.
-Image 2 is the untouched ORIGINAL — the single source of truth for how every element must look.
+    const canvasPrompt = `You are an elite OOH (Out-Of-Home) billboard graphic designer and master Art Director.
 
-Restore Image 1 so it looks natural at its current aspect ratio, while reproducing every element EXACTLY as it appears in Image 2:
-- Identical text wording, identical fonts, identical colours, identical logo artwork, identical product/house image, identical layout order (logo, headline, tagline, footer contact bar, social handles)
-- The ONLY permitted changes: (1) undo the mechanical stretch so shapes have natural proportions, and (2) extend or rebuild the background where needed to fill the frame
-- Do NOT reinterpret, restyle, recolour, modernise, add, remove or omit ANY element. If in doubt, copy Image 2 exactly.
+INPUT SPECIFICATION:
+The provided input image is a source creative centered on a padded canvas matching a ${targetRatioStr} (${referenceCanvas.width}x${referenceCanvas.height}px) target aspect ratio with solid black bars on the ${barsDesc}.
 
-Output MUST be exactly ${referenceCanvas.width}x${referenceCanvas.height}px — the same shape as Image 1.${correctionNote ? `\n\n${correctionNote}` : ""}`
-        : `You are an expert billboard creative adapter performing precise image restoration. High-fidelity, print-ready output.
+YOUR MISSION:
+Do NOT simply extend the background. Do NOT keep the source flyer as a centered box inside a frame.
+Dissolve the rectangular boundary of the central flyer completely and RECOMPOSE the entire ad campaign edge-to-edge across the full ${targetRatioStr} canvas.
 
-TASK: aspect-ratio CORRECTION of an existing advertisement. This is NOT a redesign — utmost resemblance is required.
+DECONSTRUCTION & RECOMPOSITION STEPS:
+1. IDENTIFY GRAPHIC ELEMENTS:
+   - Primary Subject/Product (e.g., food, person, hero asset)
+   - Headline & Body Text (offers, taglines, phone numbers, copy)
+   - Brand Logos & Badges
+   - Background aesthetic, lighting, and palette
 
-This image is the advertisement, mechanically stretched to ${referenceCanvas.width}x${referenceCanvas.height}px for a ${orientationWord} billboard.
+2. CANVAS REDISTRIBUTION & LAYOUT:
+   - Erase the black bars and break all original rectangular borders.
+   - Scale up and reposition the Primary Subject so it anchors one side of the ${targetWidth > targetHeight ? "wide" : "tall"} ${targetRatioStr} frame (${targetWidth > targetHeight ? "right or left third" : "top or bottom third"}).
+   - Re-render and align all text, taglines, and logos across the remaining open space, formatted for ${orientationWord} legibility.
+   - Re-generate and expand the ambient background textures, colors, and lighting seamlessly across the entire ${referenceCanvas.width}x${referenceCanvas.height}px workspace.
 
-Restore it so it looks natural at its current aspect ratio, while keeping every element EXACTLY as shown:
-- Identical text wording, identical fonts, identical colours, identical logo artwork, identical product image, identical layout
-- The ONLY permitted changes: (1) undo the mechanical stretch so shapes have natural proportions, and (2) extend or rebuild the background where needed to fill the frame
-- Do NOT reinterpret, restyle, recolour, modernise, add, remove or omit ANY element.
-
-Output MUST remain exactly ${referenceCanvas.width}x${referenceCanvas.height}px — the same aspect ratio as the input image.${correctionNote ? `\n\n${correctionNote}` : ""}`;
-
-    const parts =
-      mode === "with_original"
-        ? [stretched, { inlineData: { mimeType, data: imageBase64 } }, { text: canvasPrompt }]
-        : [stretched, { text: canvasPrompt }];
+3. STRICT QUALITY CONSTRAINTS:
+   - NO letterboxing, NO pillarboxing, and NO remaining black borders.
+   - NO poster-in-a-poster or "flyer hanging on a wall" look.
+   - All text and brand logos must remain razor-sharp, legibly rendered, and uncropped.
+   - The final output must look like a custom, professionally engineered ${targetRatioStr} ${orientationWord} billboard advertisement created natively from scratch.${correctionNote ? `\n\n${correctionNote}` : ""}`;
 
     return {
-      contents: [{ role: "user", parts }],
+      contents: [{ role: "user", parts: [padded, { text: canvasPrompt }] }],
       generationConfig: {
         responseModalities: ["IMAGE"],
       },
@@ -1542,19 +1543,17 @@ Output MUST remain exactly ${referenceCanvas.width}x${referenceCanvas.height}px 
   let geminiDims = null;
 
   for (let attempt = 0; attempt < 2; attempt += 1) {
-    // Attempt ladder: canvas path tries [stretched+original] first, then
-    // [stretched] alone if the shape came back wrong.
-    const mode = ratioCheck.withinTolerance
-      ? "native"
-      : attempt === 0 ? "with_original" : "stretched_only";
-
     let correctionNote = null;
     if (attempt > 0 && geminiDims) {
-      correctionNote = `CRITICAL CORRECTION: Your previous output was ${geminiDims.width}x${geminiDims.height}px which is the WRONG orientation/aspect ratio. The required composition is ${referenceCanvas ? `${referenceCanvas.width}x${referenceCanvas.height}` : `${targetWidth}x${targetHeight}`}px (${targetWidth > targetHeight ? "WIDE LANDSCAPE" : "TALL PORTRAIT"}). Regenerate the full design at the correct aspect ratio.`;
-      console.log(`⚠️ Gemini output AR mismatch (${geminiDims.width}x${geminiDims.height}) — retrying (mode: ${mode})`);
+      if (!ratioCheck.withinTolerance) {
+        correctionNote = "CRITICAL: your previous output did not keep the same shape and orientation as the input image — black bars were ignored or the frame was changed. Regenerate the full design so the result has the EXACT same shape and orientation as the input image, with all black bars completely filled by the extended design.";
+      } else {
+        correctionNote = `CRITICAL CORRECTION: Your previous output was ${geminiDims.width}x${geminiDims.height}px which is the WRONG orientation/aspect ratio. The required composition is ${referenceCanvas ? `${referenceCanvas.width}x${referenceCanvas.height}` : `${targetWidth}x${targetHeight}`}px (${targetWidth > targetHeight ? "WIDE LANDSCAPE" : "TALL PORTRAIT"}). Regenerate the full design at the correct aspect ratio.`;
+      }
+      console.log(`⚠️ Gemini output AR mismatch (${geminiDims.width}x${geminiDims.height}) — retrying`);
     }
 
-    const requestBody = await buildRequestBody(mode, correctionNote);
+    const requestBody = await buildRequestBody(correctionNote);
     const geminiStart = Date.now();
 
     const response = await fetch(
