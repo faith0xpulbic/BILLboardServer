@@ -1197,7 +1197,46 @@ const CRC32_TABLE = (() => {
   return table;
 })();
 
+const DEFAULT_SYSTEM_PROMPT = `You are an expert Out-Of-Home (OOH) advertisement art director and layout rescaler.
 
+TASK:
+Reconstruct and adapt the source creative so it fills the entire padded canvas edge-to-edge.
+
+1. HERO ASSET ENLARGEMENT & OCCUPANCY (CRITICAL):
+   - Scale UP the Primary Subject (product, person, or hero element) so it occupies the maximum vertical height available in the target canvas without clipping key details.
+   - Anchor the enlarged Primary Subject cleanly to one side of the layout. High visual occupancy of the hero asset reduces unnecessary empty canvas space.
+
+2. GLOBAL COLOR & LUMINANCE MAPPING:
+   - Lock the original source background color, brightness level, lighting exposure, and texture across 100% of the target canvas.
+   - DO NOT alter background luminance, introduce dark gradients, or change tonal balance from the original creative.
+
+3. TYPOGRAPHY & BRAND ASSET RESCALING:
+   - Scale headlines, taglines, and logos proportionally to match the increased scale of the Primary Subject.
+   - Position scaled typography in the remaining negative space to establish a legible horizontal reading path.
+   - STRICT LOCK: Retain original hues, saturations, and contrast on all brand marks and text. Never invert or alter logo colors.
+
+4. NEGATIVE CONSTRAINTS:
+   - NO keeping the main subject small or centered in a tiny box.
+   - NO background color shifts, dark vignettes, or invented lighting changes.
+   - NO altered logo colors, squashed aspect ratios, or letterboxing artifacts.`;
+
+const NATIVE_PATH_SYSTEM_PROMPT = "You are an expert billboard creative adapter. Analyze the source advertisement image and identify its visual hierarchy:
+
+1. PRIMARY FOCAL POINT: The main subject (product, person, or key visual element)
+2. SECONDARY ELEMENTS: Supporting text, taglines, pricing
+3. BRAND IDENTITY: Logos, brand names, social handles
+4. BACKGROUND: Colors, textures, ambient elements
+
+Your task:
+- Redesign the composition to Expand EXACTLY t the newly Requested Aspect ratio 
+- Preserve and EMPHASIZE the primary focal point — it must remain dominant and clear
+- Reposition secondary text so it reads naturally in the new aspect ratio
+- Keep logos and brand elements sharp and legible, never cropped
+- Extend or fill intelligently — match colors, patterns, and lighting seamlessly
+- If upscaling is needed, preserve fine details and text crispness
+- Fill the entirety to the new aspect ratio edge-to-edge. NO letterboxing, NO centered crops, NO black borders
+- Maintain the original creative intent and brand aesthetic exactly
+Output high-fidelity, print-ready quality.";
 
 
 // ── Utility functions ──────────────────────────────────────────────────────────
@@ -1459,44 +1498,39 @@ Fill the canvas edge-to-edge with no borders.${correctionNote ? `\n\n${correctio
       : "top and bottom";
     const orientationWord = targetWidth > targetHeight ? "horizontal" : "vertical";
 
-    const canvasPrompt = `You are an expert Out-Of-Home (OOH) advertisement art director and precision visual adapter.
+    const canvasPrompt = `You are an elite OOH (Out-Of-Home) billboard graphic designer and master Art Director.
 
 INPUT SPECIFICATION:
-The input image contains the complete source creative centered on a padded canvas, with solid empty black bars on the ${barsDesc}. Everything the final design needs — subject, text, logos, background — is ALREADY inside the centered creative. Nothing needs to be invented.
+The provided input image is a source creative centered on a padded canvas with solid black bars on the ${barsDesc}.
 
-YOUR MISSION — INTELLIGENTLY ENLARGE, DO NOT MERELY EXPAND:
-Think of this as ENLARGING the centered design to the full canvas. Enlargement is achieved through INTELLIGENT RECOMPOSITION — not by stretching the poster, and not by decorating the empty space around it.
+YOUR MISSION:
+Do NOT simply extend the background. Do NOT keep the source flyer as a centered box inside a frame.
+Dissolve the rectangular boundary of the central flyer completely and RECOMPOSE the entire ad campaign edge-to-edge across the full canvas.
 
-Step 1 — STUDY: identify the key elements inside the centered creative — the primary subject, the headline/copy block, the logos and brand marks, and the background style (colours, lighting, textures).
+DECONSTRUCTION & RECOMPOSITION STEPS:
+1. IDENTIFY GRAPHIC ELEMENTS:
+   - Primary Subject/Product (e.g., food, person, hero asset)
+   - Headline & Body Text (offers, taglines, phone numbers, copy)
+   - Brand Logos & Badges
+   - Background aesthetic, lighting, and palette
 
-Step 2 — RECOMPOSE at enlarged scale so the design fills the canvas edge-to-edge and no black remains:
-- Scale the Primary Subject UP dramatically so it occupies the maximum ${targetWidth > targetHeight ? "vertical height" : "width"} of the canvas without clipping key details, anchored cleanly to one side (${targetWidth > targetHeight ? "left or right third" : "top or bottom third"})
-- Scale typography UP proportionally with the subject — headlines, taglines and logos grow to match the enlarged scale, regrouped into the remaining space as one clean, legible block
-- The background grows outward as the natural continuation of the enlargement: extend its exact base colours, lighting gradients, textures and atmosphere into the black areas — do not imagine a new background
+2. CANVAS REDISTRIBUTION & LAYOUT:
+   - Erase the black bars and break all original rectangular borders.
+   - Scale up and reposition the Primary Subject so it anchors one side of the ${orientationWord} frame (${targetWidth > targetHeight ? "right or left third" : "top or bottom third"}).
+   - Re-render and align all text, taglines, and logos across the remaining open space, formatted for ${orientationWord} legibility.
+   - Re-generate and expand the ambient background textures, colors, and lighting seamlessly across the entire canvas.
+   - Keep the composition balanced and uncluttered: the subject anchors ONE side, text sits as one clear grouped block in the open space, and generous breathing room separates them — do NOT scatter elements into every corner or edge.
 
-1. VISUAL VIBE, LUMINANCE & AMBIENT LIGHTING LOCK (CRITICAL):
-- Match the exact brightness, colour temperature, lighting exposure and ambient atmospheric vibe of the source creative across the entire canvas
-- DO NOT darken the background or introduce heavy dark gradients if the original is bright and light (e.g., a bright sky-blue background MUST remain bright sky-blue everywhere)
-- Preserving overall exposure guarantees the original dark text and logos keep their natural contrast without flipping or inverting their colours
+3. FIDELITY LOCKS (STRICT):
+   - Match the exact brightness, colour temperature and atmospheric vibe of the source across the entire canvas — never darken a bright creative or add heavy dark gradients.
+   - NEVER recolor or invert logos, brand marks or text to match contrast — keep 100% exact hues (a dark blue logo MUST remain dark blue).
+   - Reproduce all text EXACTLY word-for-word, razor-sharp, unwarped and uncropped.
+   - Never stretch or squash any element — all scaling keeps original proportions.
 
-2. VISUAL ELEMENT IDENTIFICATION:
-Identify and deconstruct the centered creative into four components and treat each faithfully:
-a. PRIMARY SUBJECT — hero product, focal person, or key visual element
-b. BRAND IDENTITY — logos, icons, emblems, brand marks
-c. COPY & TYPOGRAPHY — headlines, taglines, subtext, calls-to-action
-d. BACKGROUND — base colours, lighting gradients, ambient textures, atmosphere
-
-3. BRAND IDENTITY & LOGO PRESERVATION (STRICT LOCK):
-- Maintain 100% exact hue, saturation and colour fidelity for all logos, brand marks and identity assets
-- NEVER recolor or invert brand assets to match contrast (e.g., a dark blue logo MUST remain dark blue)
-- All typography, iconography and logos must remain razor-sharp, unwarped and uncropped
-
-4. BALANCED FULL-CANVAS OCCUPANCY:
-- The enlarged subject anchors one side, the enlarged text block occupies the open space, and the extended background carries the rest
-- No deserted middle: the result must feel like one continuous, professionally designed ${orientationWord} billboard with natural breathing room — not a small poster with empty space tacked on
-- NO stretching or squashing of any element — all scaling keeps original proportions
-- NO background hallucination or extra unrequested objects
-- NO letterboxing, pillarboxing, framed borders, or poster-within-a-poster artifacts${correctionNote ? `\n\n${correctionNote}` : ""}`;
+4. STRICT QUALITY CONSTRAINTS:
+   - NO letterboxing, NO pillarboxing, and NO remaining black borders.
+   - NO poster-in-a-poster or "flyer hanging on a wall" look.
+   - NO extra unrequested objects or background hallucination.${correctionNote ? `\n\n${correctionNote}` : ""}`;
 
     return {
       contents: [{ role: "user", parts: [padded, { text: canvasPrompt }] }],
@@ -1937,9 +1971,9 @@ const REANIM_CLEAN_PLATE_PROMPT = (labels) => `Edit this advertisement image. Co
 
 Keep everything else EXACTLY identical: same framing, same camera position, same resolution and aspect ratio, same colors, same lighting, same remaining text and objects pixel-for-pixel. Only remove the listed elements and fill in the background behind them seamlessly.`;
 
-const REANIM_CUTOUT_PROMPT = (label) => `Edit this advertisement image. Output the SAME image with the SAME framing, composition, camera position, aspect ratio and resolution — but replace EVERYTHING EXCEPT the ${label} with flat pure solid magenta color #FF00FF.
+const REANIM_CUTOUT_PROMPT = (label) => `Edit this advertisement image. Output the SAME image with the SAME framing, composition, camera position, aspect ratio and resolution — but replace EVERYTHING EXCEPT the ${label} with one single flat, solid, pure magenta colour #FF00FF.
 
-The ${label} itself must remain completely untouched at its exact original position, scale, orientation and appearance. Every other pixel must become pure flat #FF00FF magenta with no gradients, no shadows, no anti-aliasing halos around the ${label}.`;
+The ${label} itself must remain completely untouched at its exact original position, scale, orientation and appearance. Every other pixel must become exactly #FF00FF — one uniform flat colour with no pink tints, no light magenta, no gradients, no vignettes, no shadows, no anti-aliasing halos around the ${label}. If the ${label} is text, isolate the letters themselves — never leave a coloured box, rectangle or panel behind them.`;
 
 // ── Gemini helpers ────────────────────────────────────────────────────────────
 
@@ -2109,17 +2143,44 @@ async function chromaKeyMagenta(inputBuffer) {
     const r = data[i], g = data[i + 1], b = data[i + 2];
     // Distance from pure magenta (255, 0, 255)
     const dist = Math.sqrt((255 - r) ** 2 + g ** 2 + (255 - b) ** 2);
-    if (dist < 110) {
+    if (dist < 120) {
       data[i + 3] = 0;
-    } else if (dist < 175) {
-      // Soft edge feather between the thresholds
-      data[i + 3] = Math.round(data[i + 3] * ((dist - 110) / 65));
+    } else if (dist < 190) {
+      // Soft edge: partial alpha, plus DESPILL — pull green up toward
+      // min(r, b) so semi-keyed pixels lose their magenta/pink cast instead
+      // of leaving a pink halo around the cutout.
+      const t = (dist - 120) / 70;
+      data[i + 3] = Math.round(data[i + 3] * t);
+      data[i + 1] = Math.min(g, Math.min(r, b));
     }
   }
 
   return sharp(data, { raw: { width, height, channels } })
     .png()
     .toBuffer();
+}
+
+// Fraction of opaque pixels that still look magenta/pink after keying.
+// magentaNess is only high when BOTH red and blue clearly exceed green —
+// the magenta/pink family — so white text, dark blue logos, greens and warm
+// skin tones all score low and are safe.
+function measureMagentaResidue(pngBuffer) {
+  return sharp(pngBuffer)
+    .ensureAlpha()
+    .raw()
+    .toBuffer({ resolveWithObject: true })
+    .then(({ data, info }) => {
+      const { width, height, channels } = info;
+      let flagged = 0;
+      let total = 0;
+      for (let i = 0; i < data.length; i += channels) {
+        if (data[i + 3] < 40) continue;
+        total += 1;
+        const magentaNess = (data[i] - data[i + 1]) + (data[i + 2] - data[i + 1]);
+        if (magentaNess > 100) flagged += 1;
+      }
+      return total > 0 ? flagged / total : 0;
+    });
 }
 
 // Generate an aligned transparent cutout of one element, cropped to its bbox.
@@ -2140,7 +2201,7 @@ async function generateElementCutout(origBase64, mimeType, element, canvasW, can
         ? REANIM_CUTOUT_PROMPT(element.label)
         : `${REANIM_CUTOUT_PROMPT(element.label)}
 
-CRITICAL: Your previous output did not isolate the ${element.label} — the background was not fully magenta. Output ONLY the ${element.label} itself on a flat, solid, pure #FF00FF magenta background. No sky, no gradient, no shadows, no surrounding design — every single pixel that is not part of the ${element.label} must be pure #FF00FF.`;
+CRITICAL: Your previous output did not isolate the ${element.label} — the background was not fully magenta. Output ONLY the ${element.label} itself on a flat, solid, pure #FF00FF magenta background. No sky, no gradient, no shadows, no pink tints, no light magenta, no surrounding design — every single pixel that is not part of the ${element.label} must be pure #FF00FF.`;
 
       const { base64: keyedB64 } = await generateReanimImage([
         { inlineData: { mimeType, data: origBase64 } },
@@ -2166,12 +2227,17 @@ CRITICAL: Your previous output did not isolate the ${element.label} — the back
       const stats = await sharp(cropped).stats();
       const alphaChannelIndex = stats.channels.length - 1;
       const alphaMean = stats.channels[alphaChannelIndex]?.mean ?? 255;
-      if (alphaMean < 20) {
+
+      // Also reject when magenta/pink residue remains (e.g. the model drew the
+      // text on a pink box instead of isolating it) — that poisons the render.
+      const residue = await measureMagentaResidue(cropped);
+
+      if (alphaMean < 20 || residue > 0.08) {
         if (attempt === 0) {
-          console.warn(`⚠️ Reanimate cutout for "${element.label}" is empty — retrying with reinforced prompt`);
+          console.warn(`⚠️ Reanimate cutout for "${element.label}" failed keying (alphaMean: ${alphaMean.toFixed(1)}, magenta residue: ${(residue * 100).toFixed(1)}%) — retrying with reinforced prompt`);
           continue;
         }
-        console.warn(`⚠️ Reanimate cutout for "${element.label}" still empty — dropping element`);
+        console.warn(`⚠️ Reanimate cutout for "${element.label}" still failing — dropping element`);
         return null;
       }
 
