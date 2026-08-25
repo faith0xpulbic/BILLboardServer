@@ -1197,30 +1197,26 @@ const CRC32_TABLE = (() => {
   return table;
 })();
 
-const DEFAULT_SYSTEM_PROMPT = 'You are an expert Out-Of-Home (OOH) advertisement art director and layout rescaler.
+const DEFAULT_SYSTEM_PROMPT = `You are an expert billboard creative adapter. Analyze the source advertisement image and identify its visual hierarchy:
 
-TASK:
-Reconstruct and adapt the source creative to fill the entire target canvas edge-to-edge.
+1. PRIMARY FOCAL POINT: The main subject (product, person, or key visual element)
+2. SECONDARY ELEMENTS: Supporting text, taglines, pricing
+3. BRAND IDENTITY: Logos, brand names, social handles
+4. BACKGROUND: Colors, textures, ambient elements
 
-1. HERO ASSET ENLARGEMENT & OCCUPANCY (CRITICAL):
-   - Scale UP the Primary Subject (product, person, or hero element) so it occupies the maximum vertical height available in the target canvas without clipping key details.
-   - Anchor the enlarged Primary Subject cleanly to one side of the layout. High visual occupancy of the hero asset reduces unnecessary empty canvas space.
+Your task:
+- Redesign the composition to fill the EXACT canvas dimensions provided
+- Preserve and EMPHASIZE the primary focal point — it must remain dominant and clear
+- Reposition secondary text so it reads naturally in the new aspect ratio
+- Keep logos and brand elements sharp and legible, never cropped
+- Extend or fill background intelligently — match colors, patterns, and lighting seamlessly
+- If upscaling is needed, preserve fine details and text crispness
+- Fill the entire canvas edge-to-edge. NO letterboxing, NO centered crops, NO empty borders
+- Maintain the original creative intent and brand aesthetic exactly
 
-2. GLOBAL COLOR & LUMINANCE MAPPING:
-   - Lock the original source background color, brightness level, lighting exposure, and texture across 100% of the target canvas.
-   - DO NOT alter background luminance, introduce dark gradients, or change tonal balance from the original creative.
+Output high-fidelity, print-ready quality.`;
 
-3. TYPOGRAPHY & BRAND ASSET RESCALING:
-   - Scale headlines, taglines, and logos proportionally to match the increased scale of the Primary Subject.
-   - Position scaled typography in the remaining negative space to establish a legible horizontal reading path.
-   - STRICT LOCK: Retain original hues, saturations, and contrast on all brand marks and text. Never invert or alter logo colors.
-
-4. NEGATIVE CONSTRAINTS:
-   - NO keeping the main subject small or centered in a tiny box.
-   - NO background color shifts, dark vignettes, or invented lighting changes.
-   - NO altered logo colors, squashed aspect ratios, or letterboxing artifacts.';
-
-const NATIVE_PATH_SYSTEM_PROMPT = 'You are an expert billboard creative adapter. Analyze the source advertisement image and identify its visual hierarchy:
+const NATIVE_PATH_SYSTEM_PROMPT = `You are an expert billboard creative adapter. Analyze the source advertisement image and identify its visual hierarchy:
 
 1. PRIMARY FOCAL POINT: The main subject (product, person, or key visual element)
 2. SECONDARY ELEMENTS: Supporting text, taglines, pricing
@@ -1236,7 +1232,7 @@ Your task:
 - If upscaling is needed, preserve fine details and text crispness
 - Fill the entirety to the new aspect ratio edge-to-edge. NO letterboxing, NO centered crops, NO black borders
 - Maintain the original creative intent and brand aesthetic exactly
-Output high-fidelity, print-ready quality.';
+Output high-fidelity, print-ready quality.`;
 
 
 // ── Utility functions ──────────────────────────────────────────────────────────
