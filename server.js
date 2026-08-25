@@ -1197,44 +1197,28 @@ const CRC32_TABLE = (() => {
   return table;
 })();
 
-const DEFAULT_SYSTEM_PROMPT = `You are an expert Out-Of-Home (OOH) advertisement art director and precision visual adapter.
+const DEFAULT_SYSTEM_PROMPT = `You are an expert Out-Of-Home (OOH) advertisement art director and layout rescaler.
 
-TASK OVERVIEW:
-Recompose and extend the provided source creative to fit the exact canvas target aspect ratio (${targetRatio}, ${width}x${height}px) edge-to-edge.
+TASK:
+Reconstruct and adapt the source creative to fill the target aspect ratio (${targetRatio}, ${width}x${height}px) edge-to-edge.
 
-1. VISUAL ELEMENT IDENTIFICATION & HIERARCHY ANALYSIS:
-   - Identify and deconstruct the source creative into four core components:
-     a. PRIMARY SUBJECT: Hero product, focal person, or key visual element.
-     b. BRAND IDENTITY: Logos, icons, emblems, and brand marks.
-     c. COPY & TYPOGRAPHY: Headlines, taglines, subtext, and call-to-actions.
-     d. BACKGROUND: Base colors, lighting gradients, ambient textures, and environment.
+1. HERO ASSET ENLARGEMENT & OCCUPANCY (CRITICAL):
+   - Scale UP the Primary Subject (product, person, or hero element) so it occupies the maximum vertical height available in the target canvas without clipping key details.
+   - Anchor the enlarged Primary Subject cleanly to one side of the layout. High visual occupancy of the hero asset reduces unnecessary empty canvas space.
 
-2. ELEMENT SCALING & PROPORTIONAL ADAPTATION:
-   - Scale the Primary Subject dynamically up or down so it commands appropriate visual weight and acts as the hero anchor in the new ${targetRatio} workspace.
-   - Rescale headlines, taglines, and brand logos relative to the new canvas height—ensuring they are large enough for long-distance legibility without crowding the layout.
-   - Maintain strict aspect ratio locked scaling on all elements: NEVER stretch, squash, or distort the intrinsic proportions of products, text, or logos.
+2. GLOBAL COLOR & LUMINANCE MAPPING:
+   - Lock the original source background color, brightness level, lighting exposure, and texture across 100% of the target canvas.
+   - DO NOT alter background luminance, introduce dark gradients, or change tonal balance from the original creative. 
 
-3. BRAND IDENTITY & LOGO PRESERVATION (STRICT LOCK):
-   - CRITICAL: Maintain 100% exact color, hue, saturation, and contrast fidelity for all logos, brand marks, and identity assets.
-   - DO NOT recolor, re-theme, outline, or modify any brand logo (e.g., if a logo is blue, it MUST remain the exact original shade of blue; do NOT turn it white, black, or transparent).
-   - Ensure all typography, iconography, and logos remain razor-sharp, unwarped, and completely uncropped.
+3. TYPOGRAPHY & BRAND ASSET RESCALING:
+   - Scale headlines, taglines, and logos proportionally to match the increased scale of the Primary Subject.
+   - Position scaled typography in the remaining negative space to establish a legible horizontal reading path.
+   - STRICT LOCK: Retain original hues, saturations, and contrast on all brand marks and text. Never invert or alter logo colors.
 
-4. BACKGROUND EXTENSION & FIDELITY (NO HALLUCINATIONS):
-   - Seamlessly extrapolate the EXISTING background texture, color palette, lighting drop-off, and surface properties across the new empty space.
-   - PURE SPATIAL CONTINUATION ONLY: Do NOT introduce new objects, scenery, patterns, floating elements, shapes, or structural details into the background that were not in the original source image.
-   - Match existing environmental lighting, gradients, vignette, and focus/blur parameters across the full canvas length.
-
-5. COMPOSITION & LAYOUT RESTRUCTURING:
-   - Dissolve the original rectangular image boundaries completely.
-   - Position the scaled Primary Subject according to clean horizontal advertising composition principles (e.g., anchoring a outer third of the frame).
-   - Reposition scaled copy and brand logos cleanly into negative space to create a natural left-to-right visual reading flow.
-
-6. EXPLICIT NEGATIVE CONSTRAINTS:
-   - NO squashed, stretched, or warped elements.
-   - NO background hallucination or extra objects added.
-   - NO color changes or contrast inverted on logos/brand assets.
-   - NO letterboxing, pillarboxing, framed borders, or poster-within-a-poster artifacts.
-   - NO blur artifacts, distorted copy, or altered brand colors.`;
+4. NEGATIVE CONSTRAINTS:
+   - NO keeping the main subject small or centered in a tiny box.
+   - NO background color shifts, dark vignettes, or invented lighting changes.
+   - NO altered logo colors, squashed aspect ratios, or letterboxing artifacts.;
 
 const NATIVE_PATH_SYSTEM_PROMPT = `You are an expert billboard creative adapter. Analyze the source advertisement image and identify its visual hierarchy:
 
