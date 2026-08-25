@@ -1197,7 +1197,7 @@ const CRC32_TABLE = (() => {
   return table;
 })();
 
-const DEFAULT_SYSTEM_PROMPT = `You are an expert Out-Of-Home (OOH) advertisement art director and layout rescaler.
+const DEFAULT_SYSTEM_PROMPT = "You are an expert Out-Of-Home (OOH) advertisement art director and layout rescaler.
 
 TASK:
 Reconstruct and adapt the source creative to fill the target aspect ratio (${targetRatio}, ${width}x${height}px) edge-to-edge.
@@ -1218,9 +1218,9 @@ Reconstruct and adapt the source creative to fill the target aspect ratio (${tar
 4. NEGATIVE CONSTRAINTS:
    - NO keeping the main subject small or centered in a tiny box.
    - NO background color shifts, dark vignettes, or invented lighting changes.
-   - NO altered logo colors, squashed aspect ratios, or letterboxing artifacts.';
+   - NO altered logo colors, squashed aspect ratios, or letterboxing artifacts.";
 
-const NATIVE_PATH_SYSTEM_PROMPT = `You are an expert billboard creative adapter. Analyze the source advertisement image and identify its visual hierarchy:
+const NATIVE_PATH_SYSTEM_PROMPT = "You are an expert billboard creative adapter. Analyze the source advertisement image and identify its visual hierarchy:
 
 1. PRIMARY FOCAL POINT: The main subject (product, person, or key visual element)
 2. SECONDARY ELEMENTS: Supporting text, taglines, pricing
@@ -1236,7 +1236,7 @@ Your task:
 - If upscaling is needed, preserve fine details and text crispness
 - Fill the entirety to the new aspect ratio edge-to-edge. NO letterboxing, NO centered crops, NO black borders
 - Maintain the original creative intent and brand aesthetic exactly
-Output high-fidelity, print-ready quality.`;
+Output high-fidelity, print-ready quality.";
 
 
 // ── Utility functions ──────────────────────────────────────────────────────────
