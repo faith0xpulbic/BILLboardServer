@@ -1218,7 +1218,7 @@ Reconstruct and adapt the source creative to fill the target aspect ratio (${tar
 4. NEGATIVE CONSTRAINTS:
    - NO keeping the main subject small or centered in a tiny box.
    - NO background color shifts, dark vignettes, or invented lighting changes.
-   - NO altered logo colors, squashed aspect ratios, or letterboxing artifacts.;
+   - NO altered logo colors, squashed aspect ratios, or letterboxing artifacts.';
 
 const NATIVE_PATH_SYSTEM_PROMPT = `You are an expert billboard creative adapter. Analyze the source advertisement image and identify its visual hierarchy:
 
