@@ -1197,26 +1197,30 @@ const CRC32_TABLE = (() => {
   return table;
 })();
 
-const DEFAULT_SYSTEM_PROMPT = `You are an expert billboard creative adapter. Analyze the source advertisement image and identify its visual hierarchy:
+const DEFAULT_SYSTEM_PROMPT = `You are an expert Out-Of-Home (OOH) advertisement art director and layout rescaler.
 
-1. PRIMARY FOCAL POINT: The main subject (product, person, or key visual element)
-2. SECONDARY ELEMENTS: Supporting text, taglines, pricing
-3. BRAND IDENTITY: Logos, brand names, social handles
-4. BACKGROUND: Colors, textures, ambient elements
+TASK:
+Reconstruct and adapt the source creative so it fills the entire padded canvas edge-to-edge.
 
-Your task:
-- Redesign the composition to fill the EXACT canvas dimensions provided
-- Preserve and EMPHASIZE the primary focal point — it must remain dominant and clear
-- Reposition secondary text so it reads naturally in the new aspect ratio
-- Keep logos and brand elements sharp and legible, never cropped
-- Extend or fill background intelligently — match colors, patterns, and lighting seamlessly
-- If upscaling is needed, preserve fine details and text crispness
-- Fill the entire canvas edge-to-edge. NO letterboxing, NO centered crops, NO empty borders
-- Maintain the original creative intent and brand aesthetic exactly
+1. HERO ASSET ENLARGEMENT & OCCUPANCY (CRITICAL):
+   - Scale UP the Primary Subject (product, person, or hero element) so it occupies the maximum vertical height available in the target canvas without clipping key details.
+   - Anchor the enlarged Primary Subject cleanly to one side of the layout. High visual occupancy of the hero asset reduces unnecessary empty canvas space.
 
-Output high-fidelity, print-ready quality.`;
+2. GLOBAL COLOR & LUMINANCE MAPPING:
+   - Lock the original source background color, brightness level, lighting exposure, and texture across 100% of the target canvas.
+   - DO NOT alter background luminance, introduce dark gradients, or change tonal balance from the original creative.
 
-const NATIVE_PATH_SYSTEM_PROMPT = `You are an expert billboard creative adapter. Analyze the source advertisement image and identify its visual hierarchy:
+3. TYPOGRAPHY & BRAND ASSET RESCALING:
+   - Scale headlines, taglines, and logos proportionally to match the increased scale of the Primary Subject.
+   - Position scaled typography in the remaining negative space to establish a legible horizontal reading path.
+   - STRICT LOCK: Retain original hues, saturations, and contrast on all brand marks and text. Never invert or alter logo colors.
+
+4. NEGATIVE CONSTRAINTS:
+   - NO keeping the main subject small or centered in a tiny box.
+   - NO background color shifts, dark vignettes, or invented lighting changes.
+   - NO altered logo colors, squashed aspect ratios, or letterboxing artifacts.`;
+
+const NATIVE_PATH_SYSTEM_PROMPT = "You are an expert billboard creative adapter. Analyze the source advertisement image and identify its visual hierarchy:
 
 1. PRIMARY FOCAL POINT: The main subject (product, person, or key visual element)
 2. SECONDARY ELEMENTS: Supporting text, taglines, pricing
@@ -1232,7 +1236,7 @@ Your task:
 - If upscaling is needed, preserve fine details and text crispness
 - Fill the entirety to the new aspect ratio edge-to-edge. NO letterboxing, NO centered crops, NO black borders
 - Maintain the original creative intent and brand aesthetic exactly
-Output high-fidelity, print-ready quality.`;
+Output high-fidelity, print-ready quality.";
 
 
 // ── Utility functions ──────────────────────────────────────────────────────────
@@ -1492,37 +1496,46 @@ Fill the canvas edge-to-edge with no borders.${correctionNote ? `\n\n${correctio
     const barsDesc = targetWidth > targetHeight
       ? "left and right sides"
       : "top and bottom";
-    const targetRatioStr = simplifyAspectRatio(referenceCanvas.width, referenceCanvas.height);
     const orientationWord = targetWidth > targetHeight ? "horizontal" : "vertical";
 
-    const canvasPrompt = `You are an elite OOH (Out-Of-Home) billboard graphic designer and master Art Director.
+    const canvasPrompt = `You are an expert Out-Of-Home (OOH) advertisement art director and precision visual adapter.
 
 INPUT SPECIFICATION:
-The provided input image is a source creative centered on a padded canvas matching a ${targetRatioStr} (${referenceCanvas.width}x${referenceCanvas.height}px) target aspect ratio with solid black bars on the ${barsDesc}.
+The input image contains the complete source creative centered on a padded canvas, with solid empty black bars on the ${barsDesc}. Everything the final design needs — subject, text, logos, background — is ALREADY inside the centered creative. Nothing needs to be invented.
 
-YOUR MISSION:
-Do NOT simply extend the background. Do NOT keep the source flyer as a centered box inside a frame.
-Dissolve the rectangular boundary of the central flyer completely and RECOMPOSE the entire ad campaign edge-to-edge across the full ${targetRatioStr} canvas.
+YOUR MISSION — INTELLIGENTLY ENLARGE, DO NOT MERELY EXPAND:
+Think of this as ENLARGING the centered design to the full canvas. Enlargement is achieved through INTELLIGENT RECOMPOSITION — not by stretching the poster, and not by decorating the empty space around it.
 
-DECONSTRUCTION & RECOMPOSITION STEPS:
-1. IDENTIFY GRAPHIC ELEMENTS:
-   - Primary Subject/Product (e.g., food, person, hero asset)
-   - Headline & Body Text (offers, taglines, phone numbers, copy)
-   - Brand Logos & Badges
-   - Background aesthetic, lighting, and palette
+Step 1 — STUDY: identify the key elements inside the centered creative — the primary subject, the headline/copy block, the logos and brand marks, and the background style (colours, lighting, textures).
 
-2. CANVAS REDISTRIBUTION & LAYOUT:
-   - Erase the black bars and break all original rectangular borders.
-   - Scale up and reposition the Primary Subject so it anchors one side of the ${targetWidth > targetHeight ? "wide" : "tall"} ${targetRatioStr} frame (${targetWidth > targetHeight ? "right or left third" : "top or bottom third"}).
-   - Re-render and align all text, taglines, and logos across the remaining open space, formatted for ${orientationWord} legibility.
-   - Re-generate and expand the ambient background textures, colors, and lighting seamlessly across the entire ${referenceCanvas.width}x${referenceCanvas.height}px workspace.
-   - Keep the composition balanced and uncluttered: the subject anchors ONE side, text sits as one clear grouped block in the open space, and generous breathing room separates them — do NOT scatter elements into every corner or edge.
+Step 2 — RECOMPOSE at enlarged scale so the design fills the canvas edge-to-edge and no black remains:
+- Scale the Primary Subject UP dramatically so it occupies the maximum ${targetWidth > targetHeight ? "vertical height" : "width"} of the canvas without clipping key details, anchored cleanly to one side (${targetWidth > targetHeight ? "left or right third" : "top or bottom third"})
+- Scale typography UP proportionally with the subject — headlines, taglines and logos grow to match the enlarged scale, regrouped into the remaining space as one clean, legible block
+- The background grows outward as the natural continuation of the enlargement: extend its exact base colours, lighting gradients, textures and atmosphere into the black areas — do not imagine a new background
 
-3. STRICT QUALITY CONSTRAINTS:
-   - NO letterboxing, NO pillarboxing, and NO remaining black borders.
-   - NO poster-in-a-poster or "flyer hanging on a wall" look.
-   - All text and brand logos must remain razor-sharp, legibly rendered, and uncropped.
-   - The final output must look like a custom, professionally engineered ${targetRatioStr} ${orientationWord} billboard advertisement created natively from scratch.${correctionNote ? `\n\n${correctionNote}` : ""}`;
+1. VISUAL VIBE, LUMINANCE & AMBIENT LIGHTING LOCK (CRITICAL):
+- Match the exact brightness, colour temperature, lighting exposure and ambient atmospheric vibe of the source creative across the entire canvas
+- DO NOT darken the background or introduce heavy dark gradients if the original is bright and light (e.g., a bright sky-blue background MUST remain bright sky-blue everywhere)
+- Preserving overall exposure guarantees the original dark text and logos keep their natural contrast without flipping or inverting their colours
+
+2. VISUAL ELEMENT IDENTIFICATION:
+Identify and deconstruct the centered creative into four components and treat each faithfully:
+a. PRIMARY SUBJECT — hero product, focal person, or key visual element
+b. BRAND IDENTITY — logos, icons, emblems, brand marks
+c. COPY & TYPOGRAPHY — headlines, taglines, subtext, calls-to-action
+d. BACKGROUND — base colours, lighting gradients, ambient textures, atmosphere
+
+3. BRAND IDENTITY & LOGO PRESERVATION (STRICT LOCK):
+- Maintain 100% exact hue, saturation and colour fidelity for all logos, brand marks and identity assets
+- NEVER recolor or invert brand assets to match contrast (e.g., a dark blue logo MUST remain dark blue)
+- All typography, iconography and logos must remain razor-sharp, unwarped and uncropped
+
+4. BALANCED FULL-CANVAS OCCUPANCY:
+- The enlarged subject anchors one side, the enlarged text block occupies the open space, and the extended background carries the rest
+- No deserted middle: the result must feel like one continuous, professionally designed ${orientationWord} billboard with natural breathing room — not a small poster with empty space tacked on
+- NO stretching or squashing of any element — all scaling keeps original proportions
+- NO background hallucination or extra unrequested objects
+- NO letterboxing, pillarboxing, framed borders, or poster-within-a-poster artifacts${correctionNote ? `\n\n${correctionNote}` : ""}`;
 
     return {
       contents: [{ role: "user", parts: [padded, { text: canvasPrompt }] }],
